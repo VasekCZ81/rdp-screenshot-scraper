@@ -1,0 +1,24 @@
+# Závislosti aplikace RDP Screenshot Scraper – přesně připnuté verze.
+#
+# Všechna potřebná kolečka (.whl) jsou přiložena v adresáři vendor\,
+# takže instalace nevyžaduje připojení k internetu:
+#
+#     pip install --no-index --find-links vendor -r requirements.txt
+#
+# Přesně to dělá i build.bat.
+#
+# Práce s okny (Win32 API) je řešena přes ctypes ze standardní knihovny,
+# pywin32 proto není potřeba. GUI staví na tkinter, který je součástí Pythonu.
+
+# --- běh aplikace ---
+mss==10.2.0
+Pillow==12.3.0
+
+# --- sestavení .exe (build.bat) ---
+pyinstaller==6.22.2
+pyinstaller-hooks-contrib==2026.7
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+packaging==26.3
+setuptools==84.0.0

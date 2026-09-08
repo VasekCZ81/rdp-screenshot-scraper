@@ -1,0 +1,16 @@
+# Virtuální prostředí a mezivýsledky buildu
+.venv/
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.py[cod]
+
+# Výstupy běhu aplikace – snímky obrazovky, logy a PDF konkrétních relací
+captures/
+config.json
+
+# Lokální nastavení nástrojů
+.claude/
+.vscode/
+.idea/
