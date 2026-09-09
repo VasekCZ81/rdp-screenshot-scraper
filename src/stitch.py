@@ -55,6 +55,7 @@ MIN_OVERLAP_PX = 16        # Page Down často nechá překryv jen pár řádků
 MIN_TEXT_ROWS = 12         # kolik řádků textu musí překryv obsahovat
 EDGE_BAND_RATIO = 0.04     # jak vysoký okraj snímku se zkoumá u nulového překryvu
 EDGE_TEXT_ROWS = 3         # od kolika řádků textu považujeme okraj za zaplněný
+USEFUL_SHIFT_RATIO = 0.10  # menší posun než desetina výšky je pro skládání bezcenný
 TEXT_ROW_DELTA = 15        # o kolik musí být řádek tmavší než pozadí
 OUTLIER_MAD_FACTOR = 4.0   # odchylka od obvyklého posuvu, kterou ještě tolerujeme
 MIN_TOLERANCE_PX = 24      # minimální tolerance, když je posuv naprosto pravidelný
@@ -483,6 +484,22 @@ def plan_ribbon(
     ]
 
     known = sorted(s for s in shifts[1:] if s is not None)
+    # Ověřený spoj s nepatrným posunem znamená, že se obraz skoro nehnul –
+    # pro skládání je bezcenný. Počítáme jen spoje se skutečným posunem.
+    useful = sum(
+        1
+        for p in placements[1:]
+        if p.verified and p.shift and p.shift > height * USEFUL_SHIFT_RATIO
+    )
+    joins = len(placements) - 1
+    if log and joins >= 3 and useful * 3 < joins:
+        log(
+            f"Skládání: POZOR – použitelný překryv má jen {useful} z {joins} spojů. "
+            "Sousední snímky na sebe nenavazují překryvem, takže stránky nelze "
+            "poskládat spolehlivě. Posun na jeden Page Down je větší než výška "
+            "snímané oblasti – zvětšete snímanou oblast na celou plochu dokumentu, "
+            "posouvejte dokument po menších krocích, nebo skládání vypněte."
+        )
     if log and known:
         log(
             f"Skládání: {len(paths)} snímků, posun {known[0]}–{known[-1]} px "
@@ -558,10 +575,18 @@ def render_pages(
     prefix: str = "page_",
     digits: int = 4,
     log: Callable[[str], None] | None = None,
+    sources: Sequence[str] | None = None,
 ) -> list[str]:
-    """Vykreslí stránky pásu do souborů. Otevírá jen snímky, které stránka potřebuje."""
+    """Vykreslí stránky pásu do souborů. Otevírá jen snímky, které stránka potřebuje.
+
+    `sources` umožní vykreslit z jiných souborů, než podle kterých se zarovnávalo –
+    typicky z kopií s vymazanou oblastí. Zarovnání totiž musí běžet nad původním
+    obrazem: vymazaná plocha je bílá a nedá se podle ní nic poznat.
+    """
     os.makedirs(out_dir, exist_ok=True)
     written: list[str] = []
+
+    by_path = dict(zip((p.path for p in plan.placements), sources or ()))
 
     for number, (top, bottom) in enumerate(cuts, start=1):
         height = bottom - top
@@ -571,7 +596,7 @@ def render_pages(
         for placement in plan.placements:
             if placement.bottom <= top or placement.top >= bottom:
                 continue
-            with Image.open(placement.path) as source:
+            with Image.open(by_path.get(placement.path, placement.path)) as source:
                 source = source.convert("RGB")
                 src_top = max(0, top - placement.top)
                 src_bottom = min(placement.height, bottom - placement.top)
@@ -593,6 +618,7 @@ def stitch_pages(
     out_dir: str,
     page_height: int = 0,
     log: Callable[[str], None] | None = None,
+    render_paths: Sequence[str] | None = None,
 ) -> list[str]:
     """Složí snímky do pásu a rozřeže je na stránky. Vrací cesty k novým PNG.
 
@@ -609,4 +635,4 @@ def stitch_pages(
             f"(výška stránky {page_height} px)"
             + (f", neověřených spojů: {len(unverified)}" if unverified else "")
         )
-    return render_pages(plan, cuts, out_dir, log=log)
+    return render_pages(plan, cuts, out_dir, log=log, sources=render_paths)
