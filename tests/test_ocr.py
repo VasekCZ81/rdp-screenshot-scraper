@@ -103,6 +103,64 @@ class TestResultParsing(unittest.TestCase):
                         ocr._run("languages", tmp, None, 5.0)
 
 
+class TestUpscale(unittest.TestCase):
+    """Zvětšení snímku před rozpoznáváním."""
+
+    def test_target_size_scales_and_rounds(self):
+        self.assertEqual(ocr.target_size(800, 600, 2.0), (1600, 1200))
+        self.assertEqual(ocr.target_size(801, 601, 1.5), (1202, 902))
+
+    def test_factor_below_one_keeps_original(self):
+        """Zmenšovat nechceme – OCR by přišlo o detail."""
+        self.assertEqual(ocr.target_size(800, 600, 0.5), (800, 600))
+        self.assertEqual(ocr.target_size(800, 600, 1.0), (800, 600))
+        self.assertEqual(ocr.target_size(800, 600, 0), (800, 600))
+
+    def test_factor_is_capped(self):
+        self.assertEqual(ocr.target_size(100, 100, 99.0), (400, 400))
+
+    def test_engine_limit_is_respected(self):
+        width, height = ocr.target_size(6000, 4000, 4.0)
+        self.assertLessEqual(max(width, height), ocr.MAX_IMAGE_DIMENSION)
+        self.assertAlmostEqual(width / height, 6000 / 4000, places=3)
+
+    def test_zero_size_is_passed_through(self):
+        self.assertEqual(ocr.target_size(0, 0, 2.0), (0, 0))
+
+    def _payload_for(self, scale: float, size=(400, 300)):
+        from PIL import Image
+
+        captured: dict = {}
+
+        def fake_run(mode, workdir, payload, timeout, on_progress=None):
+            captured.update(payload)
+            return {"pages": [{"width": 1, "height": 1, "words": []}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "page_0001.png")
+            Image.new("RGB", size, "white").save(path, "PNG")
+            with mock.patch.object(ocr, "_run", side_effect=fake_run):
+                ocr.recognize([path], "cs", scale=scale)
+        return captured
+
+    def test_payload_carries_scaled_size(self):
+        payload = self._payload_for(2.0)
+        self.assertEqual(payload["images"][0]["w"], 800)
+        self.assertEqual(payload["images"][0]["h"], 600)
+
+    def test_payload_without_scaling_keeps_original_size(self):
+        payload = self._payload_for(1.0)
+        self.assertEqual(payload["images"][0]["w"], 400)
+        self.assertEqual(payload["images"][0]["h"], 300)
+
+    def test_unreadable_file_leaves_size_to_decoder(self):
+        with mock.patch.object(
+            ocr, "_run", return_value={"pages": [{"width": 1, "height": 1, "words": []}]}
+        ) as run:
+            ocr.recognize(["nic.png"], "cs", scale=2.0)
+        self.assertEqual(run.call_args[0][2]["images"][0], {"path": mock.ANY, "w": 0, "h": 0})
+
+
 class TestAvailability(unittest.TestCase):
     def test_is_available_matches_language_tags(self):
         with mock.patch.object(ocr, "available_languages", return_value=["cs", "en-GB"]):
@@ -204,6 +262,31 @@ class TestLiveEngine(unittest.TestCase):
             self.assertGreater(word.width, 0)
             self.assertGreater(word.height, 0)
             self.assertLessEqual(word.x + word.width, pages[0].width + 5)
+
+    def test_upscaled_recognition_uses_enlarged_coordinates(self):
+        """Zvětšení se děje ve WinRT – souřadnice pak platí ve zvětšeném rozměru."""
+        from PIL import Image, ImageDraw, ImageFont
+
+        font_path = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "arial.ttf")
+        if not os.path.isfile(font_path):
+            self.skipTest("není k dispozici písmo Arial")
+
+        image = Image.new("RGB", (500, 120), "white")
+        draw = ImageDraw.Draw(image)
+        draw.text((20, 30), "maly text stranky", fill="black",
+                  font=ImageFont.truetype(font_path, 15))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "page_0001.png")
+            image.save(path, "PNG")
+            language = ocr.available_languages()[0]
+            pages = ocr.recognize([path], language, scale=2.0)
+
+        self.assertIsNotNone(pages[0], "OCR nevrátilo výsledek")
+        self.assertEqual((pages[0].width, pages[0].height), (1000, 240))
+        for word in pages[0].words:
+            self.assertLessEqual(word.x + word.width, pages[0].width + 5)
+            self.assertLessEqual(word.y + word.height, pages[0].height + 5)
 
 
 if __name__ == "__main__":

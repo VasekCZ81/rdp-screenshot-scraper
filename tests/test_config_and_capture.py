@@ -45,6 +45,24 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(cfg.page_down_method, "sendinput")
         self.assertEqual(cfg.rdp_host, "", "prázdná adresa je platný stav")
 
+    def test_page_width_mm_defaults_to_disabled_and_clamps(self):
+        self.assertEqual(AppConfig().pdf_page_width_mm, 0.0)
+        cfg = AppConfig(pdf_page_width_mm=-10)
+        cfg.clamp()
+        self.assertEqual(cfg.pdf_page_width_mm, 0.0)
+        cfg = AppConfig(pdf_page_width_mm="210")  # z config.json může přijít text
+        cfg.clamp()
+        self.assertEqual(cfg.pdf_page_width_mm, 210.0)
+
+    def test_upscale_defaults_and_clamps(self):
+        cfg = AppConfig()
+        self.assertEqual(cfg.ocr_upscale, 2.0)
+        self.assertEqual(cfg.pdf_upscale, 1.0)
+        cfg = AppConfig(ocr_upscale=99, pdf_upscale=0.25)
+        cfg.clamp()
+        self.assertEqual(cfg.ocr_upscale, 4.0)
+        self.assertEqual(cfg.pdf_upscale, 1.0, "zmenšovat nechceme")
+
     def test_rdp_host_is_kept_and_trimmed(self):
         cfg = AppConfig(rdp_host="  192.168.1.100  ")
         cfg.clamp()

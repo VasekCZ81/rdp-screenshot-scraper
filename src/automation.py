@@ -88,7 +88,11 @@ def ocr_pages(
                 status(f"{Status.OCR.value} ({index}/{total})")
 
         layers = ocr.recognize(
-            page_files, config.ocr_language, on_progress=on_progress, log=_log
+            page_files,
+            config.ocr_language,
+            on_progress=on_progress,
+            log=_log,
+            scale=config.ocr_upscale,
         )
     except ocr.OcrError as exc:
         _log(f"OCR selhalo, PDF vznikne bez textové vrstvy: {exc}")
@@ -473,6 +477,9 @@ class AutomationController:
             dpi=self.config.pdf_dpi,
             text_layers=layers,
             log=lambda m: self.log.info(m),
+            page_width_mm=self.config.pdf_page_width_mm or None,
+            upscale=self.config.pdf_upscale,
+            sharpen=self.config.pdf_sharpen,
         )
         self._log(f"PDF vytvořeno: {pdf_path}")
         return pdf_path

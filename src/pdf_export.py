@@ -8,6 +8,10 @@ Vlastnosti výstupu:
   * jeden snímek = jedna stránka,
   * stránka má rozměr přesně odpovídající pixelům při zadaném DPI, takže
     nedochází k roztažení ani ke změně poměru stran,
+  * místo pevného DPI lze zadat fyzickou šířku předlohy (`page_width_mm`)
+    a DPI se pro každou stránku dopočítá z její šířky v pixelech – stránky
+    pak mají reálnou velikost dokumentu a prohlížeč je nezmenšuje na zlomek
+    (právě to zmenšování dělá z ostrého snímku rozmazaný text),
   * žádná rotace,
   * pořadí stránek odpovídá pořadí předaných souborů.
 
@@ -31,10 +35,18 @@ import zlib
 from collections import Counter
 from typing import Callable, Sequence
 
-from PIL import Image
+from PIL import Image, ImageFilter
 
 # Courier: všechny glyfy mají šířku 600/1000 em.
 COURIER_WIDTH = 0.600
+MM_PER_INCH = 25.4
+MIN_DPI = 1
+MAX_DPI = 1200
+MAX_UPSCALE = 4.0
+MAX_SHARPEN = 300.0
+# Práh drží ploché plochy beze změny – doostřuje se jen na hranách písma,
+# takže se nezvýrazní artefakty kodeku RDP v prázdném papíru.
+SHARPEN_THRESHOLD = 3
 # Účaří odhadneme kousek nad spodní hranou rámečku slova (místo pro dolní dotažnice).
 BASELINE_RATIO = 0.82
 MAX_ENCODED_CHARS = 255  # kódy 1..255, nula se nepoužívá
@@ -161,17 +173,69 @@ def _text_operators(
 
 
 # ---------------------------------------------------------------------------
+def dpi_for_width(width_px: int, page_width_mm: float) -> float:
+    """DPI, při kterém bude snímek široký `width_px` odpovídat `page_width_mm`.
+
+    Například stránka A4 (210 mm) nasnímaná v šířce 1600 px vyjde na 193 DPI.
+    Výsledek je omezen na rozsah, který dává v PDF smysl.
+    """
+    if width_px <= 0 or page_width_mm <= 0:
+        raise ValueError("Šířka snímku i předlohy musí být kladná.")
+    dpi = width_px / (page_width_mm / MM_PER_INCH)
+    return max(float(MIN_DPI), min(float(MAX_DPI), dpi))
+
+
+def prepare_image(
+    img: Image.Image, upscale: float = 1.0, sharpen: float = 0.0
+) -> Image.Image:
+    """Zvětšení (LANCZOS) a doostření (unsharp mask) jednoho snímku.
+
+    Doostření se dělá až po zvětšení a poloměr roste s faktorem – tah písma je
+    po zvětšení širší, takže na něj musí sáhnout širší maska. Detail to
+    nevrátí; zvýší kontrast na hranách, které přeškálování a kodek RDP
+    rozmazaly.
+    """
+    factor = max(1.0, min(MAX_UPSCALE, float(upscale or 1.0)))
+    amount = max(0.0, min(MAX_SHARPEN, float(sharpen or 0.0)))
+
+    target = (max(1, round(img.width * factor)), max(1, round(img.height * factor)))
+    if target != img.size:
+        img = img.resize(target, Image.LANCZOS)
+    if amount > 0:
+        img = img.filter(
+            ImageFilter.UnsharpMask(
+                radius=max(0.5, factor), percent=int(round(amount)),
+                threshold=SHARPEN_THRESHOLD,
+            )
+        )
+    return img
+
+
 def images_to_pdf(
     image_paths: Sequence[str],
     pdf_path: str,
     dpi: int = 96,
     text_layers: Sequence[object] | None = None,
     log: Callable[[str], None] | None = None,
+    page_width_mm: float | None = None,
+    upscale: float = 1.0,
+    sharpen: float = 0.0,
 ) -> str:
     """Vytvoří PDF z uvedených obrázků. Vrací cestu k PDF.
 
     `text_layers` je volitelný seznam stejné délky jako `image_paths`
     s výsledky OCR (`ocr.PageText`); položka `None` znamená stránku bez textu.
+
+    `page_width_mm` (kladné číslo) je fyzická šířka předlohy. Je-li zadaná,
+    má přednost před `dpi` a rozlišení stránky se dopočítá z šířky snímku.
+
+    `upscale` zvětší obrázek před vložením (LANCZOS). Fyzická velikost stránky
+    se nemění – do stejného rámce se jen vloží víc vzorků, takže prohlížeč ani
+    tiskárna nepracuje s tak hrubou předlohou. Detail to nepřidá, soubor
+    naroste zhruba s druhou mocninou faktoru.
+
+    `sharpen` je síla doostření v procentech (unsharp mask, 0 = vypnuto).
+    Rozumné hodnoty jsou 80–150; vyšší dělá kolem písmen světlé lemy.
     """
     paths = [p for p in image_paths if p]
     if not paths:
@@ -180,8 +244,13 @@ def images_to_pdf(
     if missing:
         raise PdfExportError(f"Chybí soubor se snímkem: {missing[0]}")
 
-    dpi = max(1, int(dpi))
+    dpi = max(MIN_DPI, min(MAX_DPI, int(dpi)))
     scale = 72.0 / dpi
+    auto_width_mm = float(page_width_mm) if page_width_mm else 0.0
+    if auto_width_mm < 0:
+        raise PdfExportError("Šířka předlohy nesmí být záporná.")
+    factor = max(1.0, min(MAX_UPSCALE, float(upscale or 1.0)))
+    amount = max(0.0, min(MAX_SHARPEN, float(sharpen or 0.0)))
     count = len(paths)
 
     layers: list[object | None] = list(text_layers or [])
@@ -252,10 +321,35 @@ def images_to_pdf(
                     if img.mode != "RGB":
                         img = img.convert("RGB")
                     width, height = img.size
+                    if width <= 0 or height <= 0:
+                        raise PdfExportError(f"Snímek {path} má nulový rozměr.")
+                    # Rámec stránky vychází z původního rozměru; zvětšení mění
+                    # jen počet vzorků uvnitř něj.
+                    img = prepare_image(img, factor, amount)
+                    sample_w, sample_h = img.size
                     raw = img.tobytes()
 
-                if width <= 0 or height <= 0:
-                    raise PdfExportError(f"Snímek {path} má nulový rozměr.")
+                # DPI buď pevné, nebo dopočítané tak, aby stránka byla široká
+                # přesně `auto_width_mm` – každá stránka zvlášť, kdyby se
+                # rozměry snímků lišily.
+                if auto_width_mm:
+                    page_dpi = dpi_for_width(width, auto_width_mm)
+                    if log and index == 0:
+                        log(
+                            f"PDF: šířka předlohy {auto_width_mm:.1f} mm při {width} px "
+                            f"=> {page_dpi:.0f} DPI"
+                        )
+                else:
+                    page_dpi = float(dpi)
+                page_scale = 72.0 / page_dpi
+                if log and index == 0:
+                    if (sample_w, sample_h) != (width, height):
+                        log(
+                            f"PDF: snímky zvětšeny {factor:g}× na {sample_w}×{sample_h} px "
+                            f"(hustota stránky {page_dpi * factor:.0f} DPI)"
+                        )
+                    if amount > 0:
+                        log(f"PDF: doostření {amount:g} %")
 
                 compressed = zlib.compress(raw, 6)
                 del raw
@@ -265,7 +359,7 @@ def images_to_pdf(
                     image_id,
                     (
                         "<< /Type /XObject /Subtype /Image "
-                        f"/Width {width} /Height {height} "
+                        f"/Width {sample_w} /Height {sample_h} "
                         "/ColorSpace /DeviceRGB /BitsPerComponent 8 "
                         f"/Filter /FlateDecode /Length {len(compressed)} >>"
                     ).encode("ascii"),
@@ -274,13 +368,13 @@ def images_to_pdf(
                 del compressed
 
                 # Rozměr stránky v bodech (1 bod = 1/72"), aby 1 px = 1/dpi palce.
-                pw = width * scale
-                ph = height * scale
+                pw = width * page_scale
+                ph = height * page_scale
                 content = f"q {pw:.4f} 0 0 {ph:.4f} 0 0 cm /Im0 Do Q\n".encode("ascii")
 
                 layer = layers[index]
                 if encoding and layer is not None:
-                    text_ops = _text_operators(layer, encoding, width, height, scale)
+                    text_ops = _text_operators(layer, encoding, width, height, page_scale)
                     if text_ops:
                         content += text_ops
                         words_total += len(getattr(layer, "words", ()))

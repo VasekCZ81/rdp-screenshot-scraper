@@ -252,10 +252,79 @@ vedle `.exe`.
 | Tolerance průměrného rozdílu | 0.01 | max. normalizovaný průměrný rozdíl jasu |
 | Tolerance podílu změněných pixelů | 0.005 | max. podíl výrazně změněných pixelů |
 | DPI stránky PDF | 96 | určuje fyzický rozměr stránky |
+| Šířka předlohy [mm] | 0 | 0 = vypnuto; kladná hodnota DPI dopočítá – viz níže |
+| Zvětšení snímku pro PDF | 1 | 1–4×; víc vzorků na stránku, detail nepřidá |
+| Doostření pro PDF [%] | 0 | 0–300; unsharp mask, rozumně 80–150 |
+| Zvětšení snímku pro OCR | 2 | 1–4×; drobné písmo engine rozpozná spolehlivěji |
 | Adresa RDP relace | *(prázdné)* | **povinné** – podle ní se hledá okno `mstsc.exe` |
 | Metoda odeslání Page Down | sendinput | `sendinput` / `postmessage` |
 | Provést OCR | zapnuto | vyhledatelná textová vrstva v PDF |
 | Jazyk OCR | cs | jazyková značka, např. `cs` nebo `en-GB` |
+
+### Automatický odhad DPI stránky PDF
+
+Snímky jdou do PDF bezeztrátově a v původním rozlišení, ale pevných 96 DPI dělá
+ze snímku širokého 1920 px stránku širokou 508 mm. Takovou stránku každý
+prohlížeč zmenší na zlomek velikosti a text vypadá rozmazaně, přestože je
+v souboru ostrý.
+
+Stačí proto do pole **Šířka předlohy [mm]** zadat, jak je snímaný dokument
+doopravdy široký (A4 na výšku = 210, na šířku = 297). DPI se pak dopočítá ze
+šířky snímku a má přednost před polem *DPI stránky PDF*:
+
+```
+DPI = šířka snímku v px / (šířka předlohy v mm / 25.4)
+```
+
+Například A4 nasnímaná v šířce 1600 px vyjde na 194 DPI. Stránky mají skutečnou
+velikost dokumentu, „100 %“ v prohlížeči odpovídá reálné velikosti a tisk
+proběhne v plném rozlišení snímku. Dialog *Nastavení* rovnou ukazuje, jaké DPI
+z aktuálně vybrané oblasti vychází. Hodnota 0 chování nemění – použije se pevné
+*DPI stránky PDF*. Přepočet je v [src/pdf_export.py](src/pdf_export.py)
+(`dpi_for_width`) a dělá se pro každou stránku zvlášť, takže i snímky odlišných
+rozměrů vyjdou ve stejné fyzické šířce.
+
+### Zvětšení snímku (upscale)
+
+Obě pole zvětšují snímek jen pro daný účel – uložené PNG zůstávají netknuté
+a fyzická velikost stránky PDF se nemění.
+
+**Pro OCR** (výchozí 2×) se snímek zvětší přímo při dekódování ve WinRT
+(`BitmapTransform`, filtr Fant), takže nevzniká zvětšená kopie na disku ani
+v paměti. Souřadnice slov pak platí ve zvětšeném rozměru a `pdf_export` je
+přepočítá zpět podle `PageText.width/height`. Zvětšení nepřidá informaci, ale
+posune rozhodovací práh enginu. Naměřeno na vykresleném textu (jazyk `cs`,
+27 slov):
+
+| Výška písma | bez zvětšení | 2× | 3× |
+|---|---|---|---|
+| 10 px | 44 % | 78 % | 85 % |
+| 12 px | 96 % | 96 % | 93 % |
+| 14 px | 89 % | 89 % | 96 % |
+| 18 px | 96 % | 96 % | 96 % |
+
+Od zhruba 12 px výšky písma je efekt nulový, u drobnějšího textu velký – proto
+výchozí 2×. Cena je delší OCR, obrázek se v paměti zvětší na čtyřnásobek.
+
+**Pro PDF** (výchozí 1× = vypnuto) se snímek přepočítá filtrem LANCZOS a do
+stejně velkého rámce stránky se vloží víc vzorků. Detail to nepřidá – zdrojem
+zůstává původní snímek – ale prohlížeč pak nezmenšuje tak hrubou předlohu a
+text bývá při zobrazení hladší. Soubor roste zhruba s druhou mocninou faktoru,
+takže 2× znamená několikanásobně větší PDF. Vyplatí se to zkusit teprve tehdy,
+když nejde zvýšit rozlišení samotné RDP relace.
+
+### Doostření (unsharp mask)
+
+Pole **Doostření pro PDF [%]** zvýší kontrast na hranách písmen – to je jediná
+úprava, která opticky vrátí část ostrosti sežrané škálováním a kodekem RDP.
+Dělá se až po zvětšení a poloměr masky roste s jeho faktorem, protože tah písma
+je po zvětšení širší ([`prepare_image`](src/pdf_export.py)).
+
+Práh (`SHARPEN_THRESHOLD = 3`) drží ploché plochy beze změny, takže se
+nezvýrazní šum kodeku v prázdném papíru. Rozumné hodnoty jsou 80–150; nad 200 %
+vznikají kolem písmen světlé lemy a text začíná vypadat kostrbatě. Na dokonale
+ostré hraně (čistá černá na čisté bílé) se nezmění nic – doostřit jde jen to,
+co je rozmazané.
 
 ### Poznámka k odesílání Page Down
 

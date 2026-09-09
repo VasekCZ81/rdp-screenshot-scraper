@@ -87,11 +87,20 @@ class AppConfig:
     rdp_host: str = ""
     page_down_method: str = "sendinput"  # "sendinput" | "postmessage"
     pdf_dpi: int = 96                    # DPI použité pro velikost stránky PDF
+    # Fyzická šířka snímané předlohy v mm. Kladná hodnota má přednost před
+    # pdf_dpi – rozlišení stránky se dopočítá ze šířky snímku (A4 = 210).
+    pdf_page_width_mm: float = 0.0
+    # Zvětšení snímku před vložením do PDF (1.0 = beze změny). Fyzická velikost
+    # stránky zůstává stejná, jen se do ní vloží víc vzorků.
+    pdf_upscale: float = 1.0
+    # Doostření (unsharp mask) v procentech; 0 = vypnuto, rozumně 80-150.
+    pdf_sharpen: float = 0.0
     save_duplicates: bool = True         # ukládat potvrzovací duplicity do duplicates/
 
     # --- OCR (vestavěný engine Windows) ---
     ocr_enabled: bool = True             # vložit do PDF neviditelnou textovou vrstvu
     ocr_language: str = "cs"             # jazyková značka, např. "cs" nebo "en-GB"
+    ocr_upscale: float = 2.0             # zvětšení snímku před OCR (1.0 = vypnuto)
 
     # ------------------------------------------------------------------
     def clamp(self) -> None:
@@ -106,12 +115,18 @@ class AppConfig:
         self.pixel_threshold = max(0.0, min(1.0, float(self.pixel_threshold)))
         self.changed_threshold = max(0.0, min(1.0, float(self.changed_threshold)))
         self.pdf_dpi = max(1, min(1200, int(self.pdf_dpi)))
+        # 0 = vypnuto; horní mez pokrývá i velké formáty (A0 má 841 mm).
+        self.pdf_page_width_mm = max(0.0, min(2000.0, float(self.pdf_page_width_mm)))
         if self.page_down_method not in ("sendinput", "postmessage"):
             self.page_down_method = "sendinput"
         # Prázdná adresa je platný stav – znamená „uživatel ještě nezadal“.
         self.rdp_host = str(self.rdp_host).strip()
         self.ocr_enabled = bool(self.ocr_enabled)
         self.ocr_language = str(self.ocr_language).strip() or "cs"
+        # Nad 4× už jen roste čas a velikost, kvalita ne.
+        self.ocr_upscale = max(1.0, min(4.0, float(self.ocr_upscale)))
+        self.pdf_upscale = max(1.0, min(4.0, float(self.pdf_upscale)))
+        self.pdf_sharpen = max(0.0, min(300.0, float(self.pdf_sharpen)))
 
     # ------------------------------------------------------------------
     @classmethod

@@ -23,7 +23,7 @@ from automation import (
 )
 from capture import Region
 from config import APP_NAME, AppConfig
-from pdf_export import PdfExportError, images_to_pdf
+from pdf_export import PdfExportError, dpi_for_width, images_to_pdf
 from region_selector import select_region
 
 PAD = 8
@@ -92,11 +92,19 @@ class SettingsDialog(tk.Toplevel):
         ("pixel_threshold", "Tolerance průměrného rozdílu (0.0-1.0)", float),
         ("changed_threshold", "Tolerance podílu změněných pixelů", float),
         ("pdf_dpi", "DPI stránky PDF", int),
+        ("pdf_page_width_mm", "Šířka předlohy [mm] (0 = použít DPI)", float),
+        ("pdf_upscale", "Zvětšení snímku pro PDF (1 = vypnuto)", float),
+        ("pdf_sharpen", "Doostření pro PDF [%] (0 = vypnuto)", float),
+        ("ocr_upscale", "Zvětšení snímku pro OCR (1 = vypnuto)", float),
         ("rdp_host", "Adresa RDP relace (povinné)", str),
     ]
 
     def __init__(
-        self, master: tk.Misc, config: AppConfig, ocr_languages: list[str] | None = None
+        self,
+        master: tk.Misc,
+        config: AppConfig,
+        ocr_languages: list[str] | None = None,
+        region_width: int | None = None,
     ) -> None:
         super().__init__(master)
         self.title("Nastavení")
@@ -104,6 +112,7 @@ class SettingsDialog(tk.Toplevel):
         self.config_obj = config
         self.saved = False
         self._ocr_languages = ocr_languages or []
+        self._region_width = region_width or 0
         self._vars: dict[str, tk.StringVar] = {}
 
         frame = ttk.Frame(self, padding=PAD)
@@ -118,6 +127,13 @@ class SettingsDialog(tk.Toplevel):
             )
 
         row = len(self.FIELDS)
+        self._dpi_hint = ttk.Label(frame, foreground="#555555", justify="left")
+        self._dpi_hint.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 4))
+        for key in ("pdf_dpi", "pdf_page_width_mm", "pdf_upscale"):
+            self._vars[key].trace_add("write", lambda *_a: self._update_dpi_hint())
+        self._update_dpi_hint()
+
+        row += 1
         self._method = tk.StringVar(value=config.page_down_method)
         ttk.Label(frame, text="Metoda odeslání Page Down").grid(
             row=row, column=0, sticky="w", pady=2
@@ -197,6 +213,62 @@ class SettingsDialog(tk.Toplevel):
 
         self.transient(master)
         self.grab_set()
+
+    def _float_var(self, key: str, default: float) -> float | None:
+        """Hodnota pole jako float; None znamená nečitelný vstup."""
+        raw = self._vars[key].get().strip().replace(",", ".")
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def _update_dpi_hint(self) -> None:
+        """Ukáže, jaká hustota z aktuálních hodnot vyjde pro vybranou oblast."""
+        width_mm = self._float_var("pdf_page_width_mm", 0.0)
+        factor = self._float_var("pdf_upscale", 1.0)
+        if width_mm is None or factor is None:
+            self._dpi_hint.configure(text="Šířka předlohy / zvětšení: neplatná hodnota.")
+            return
+        factor = max(1.0, min(4.0, factor))
+
+        upscale_note = ""
+        if factor > 1.0:
+            upscale_note = f" Se zvětšením {factor:g}× nese stránka {{dpi}} DPI."
+
+        if width_mm <= 0:
+            fixed = self._float_var("pdf_dpi", 0.0)
+            base = f"{fixed:.0f}" if fixed else "?"
+            note = (
+                upscale_note.format(dpi=f"{fixed * factor:.0f}")
+                if (upscale_note and fixed)
+                else upscale_note.format(dpi="?")
+            )
+            self._dpi_hint.configure(
+                text=(
+                    f"Šířka předlohy 0 = použije se pevné DPI stránky ({base}).{note}\n"
+                    "Zadáním šířky (A4 = 210 mm) se DPI dopočítá ze snímku."
+                )
+            )
+            return
+        if self._region_width <= 0:
+            self._dpi_hint.configure(
+                text=(
+                    f"Šířka předlohy {width_mm:g} mm má přednost před DPI.\n"
+                    "Výsledné DPI se dopočítá ze šířky snímku při exportu."
+                )
+            )
+            return
+        dpi = dpi_for_width(self._region_width, width_mm)
+        note = upscale_note.format(dpi=f"{dpi * factor:.0f}") if upscale_note else ""
+        self._dpi_hint.configure(
+            text=(
+                f"Oblast {self._region_width} px při šířce {width_mm:g} mm "
+                f"=> {dpi:.0f} DPI.{note}\n"
+                "Šířka předlohy má přednost před polem DPI stránky PDF."
+            )
+        )
 
     def _save(self) -> None:
         values: dict[str, object] = {}
@@ -667,7 +739,14 @@ class ScraperApp(tk.Tk):
                 )
                 self._emit("status", Status.MAKING_PDF.value)
                 images_to_pdf(
-                    pages, pdf_path, dpi=self.config_obj.pdf_dpi, text_layers=layers
+                    pages,
+                    pdf_path,
+                    dpi=self.config_obj.pdf_dpi,
+                    text_layers=layers,
+                    log=lambda message: self._emit("log", message),
+                    page_width_mm=self.config_obj.pdf_page_width_mm or None,
+                    upscale=self.config_obj.pdf_upscale,
+                    sharpen=self.config_obj.pdf_sharpen,
                 )
             except PdfExportError as exc:
                 self._emit("pdf_failed", str(exc))
@@ -691,7 +770,12 @@ class ScraperApp(tk.Tk):
         if self._automation_active():
             messagebox.showinfo(APP_NAME, "Nastavení nelze měnit během snímání.")
             return
-        dialog = SettingsDialog(self, self.config_obj, self.ocr_languages)
+        dialog = SettingsDialog(
+            self,
+            self.config_obj,
+            self.ocr_languages,
+            region_width=self.region.width if self.region else None,
+        )
         self.wait_window(dialog)
         if dialog.saved:
             self._append_log("Nastavení uloženo.")

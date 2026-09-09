@@ -8,6 +8,13 @@ WinRT API se volá přes krátký PowerShell skript – ten je vložen přímo v
 souboru, takže funguje i ze sestaveného `.exe` bez dalších datových souborů.
 Všechny stránky se zpracují v JEDNOM procesu PowerShellu; průběh hlásí skript
 řádky `PROGRESS i n` na standardní výstup.
+
+Snímek lze před rozpoznáváním zvětšit (`scale`). Engine Windows si u drobného
+písma znatelně polepší, když je řádek vyšší; zvětšení sice nepřidá informaci,
+ale rozhodovací práh enginu posune. Škáluje se přímo při dekódování obrázku
+(`BitmapTransform`), takže na disku ani v paměti Pythonu nevzniká zvětšená
+kopie. Souřadnice slov pak platí ve zvětšeném rozměru – proto se s nimi vrací
+i `PageText.width/height`, podle kterých je `pdf_export` přepočítá zpátky.
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ from dataclasses import dataclass
 from typing import Callable, Sequence
 
 MAX_IMAGE_DIMENSION = 10000  # limit Windows.Media.Ocr
+MAX_UPSCALE = 4.0
 CREATE_NO_WINDOW = 0x08000000
 
 # PowerShell 5.1 je na Windows 10/11 vždy k dispozici a s WinRT pracuje
@@ -87,6 +95,12 @@ function Await($WinRtTask, $ResultType) {
 
 $null = [Windows.Storage.StorageFile, Windows.Foundation, ContentType = WindowsRuntime]
 $null = [Windows.Graphics.Imaging.BitmapDecoder, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapTransform, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapPixelFormat, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapAlphaMode, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.BitmapInterpolationMode, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.ExifOrientationMode, Windows.Foundation, ContentType = WindowsRuntime]
+$null = [Windows.Graphics.Imaging.ColorManagementMode, Windows.Foundation, ContentType = WindowsRuntime]
 $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
 $null = [Windows.Globalization.Language, Windows.Foundation, ContentType = WindowsRuntime]
 
@@ -137,15 +151,37 @@ $sb = New-Object System.Text.StringBuilder
 
 $index = 0
 $total = $images.Count
-foreach ($path in $images) {
+foreach ($item in $images) {
     if ($index -gt 0) { [void]$sb.Append(',') }
     $index++
     Write-Output ("PROGRESS {0} {1}" -f $index, $total)
     try {
+        $path = [string]$item.path
+        $targetWidth = [int]$item.w
+        $targetHeight = [int]$item.h
+
         $file = Await ([Windows.Storage.StorageFile]::GetFileFromPathAsync($path)) ([Windows.Storage.StorageFile])
         $stream = Await ($file.OpenAsync([Windows.Storage.FileAccessMode]::Read)) ([Windows.Storage.Streams.IRandomAccessStream])
         $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
-        $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+
+        if ($targetWidth -gt 0 -and $targetHeight -gt 0 -and
+            ($targetWidth -ne $decoder.PixelWidth -or $targetHeight -ne $decoder.PixelHeight)) {
+            # Zvětšení už při dekódování – Fant je nejkvalitnější filtr WinRT.
+            $transform = [Windows.Graphics.Imaging.BitmapTransform]::new()
+            $transform.ScaledWidth = [uint32]$targetWidth
+            $transform.ScaledHeight = [uint32]$targetHeight
+            $transform.InterpolationMode = [Windows.Graphics.Imaging.BitmapInterpolationMode]::Fant
+            $bitmap = Await ($decoder.GetSoftwareBitmapAsync(
+                [Windows.Graphics.Imaging.BitmapPixelFormat]::Bgra8,
+                [Windows.Graphics.Imaging.BitmapAlphaMode]::Premultiplied,
+                $transform,
+                [Windows.Graphics.Imaging.ExifOrientationMode]::IgnoreExifOrientation,
+                [Windows.Graphics.Imaging.ColorManagementMode]::DoNotColorManage)) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        }
+        else {
+            $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+        }
+
         $result = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
 
         [void]$sb.AppendFormat('{{"width":{0},"height":{1},"words":[',
@@ -280,22 +316,77 @@ def is_available(language: str | None = None) -> bool:
     return any(tag.lower() == wanted or tag.lower().startswith(wanted + "-") for tag in tags)
 
 
+def target_size(width: int, height: int, scale: float) -> tuple[int, int]:
+    """Rozměr, na který se snímek zvětší před OCR.
+
+    Faktor je omezen na `MAX_UPSCALE` a navíc tak, aby se snímek vešel do
+    limitu enginu (`MAX_IMAGE_DIMENSION`). Vrací původní rozměr, pokud se
+    nemá škálovat.
+    """
+    if width <= 0 or height <= 0:
+        return width, height
+    factor = max(1.0, min(MAX_UPSCALE, float(scale or 1.0)))
+    factor = min(factor, MAX_IMAGE_DIMENSION / width, MAX_IMAGE_DIMENSION / height)
+    if factor <= 1.0:
+        return width, height
+    return max(1, round(width * factor)), max(1, round(height * factor))
+
+
+def _scaled_sizes(
+    paths: Sequence[str], scale: float
+) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    """Dvojice (původní rozměr, cílový rozměr) pro každou stránku.
+
+    U souboru, který nejde otevřít, vrací (0, 0) – skript pak nechá rozměr
+    na dekodéru a případnou chybu ohlásí u konkrétní stránky.
+    """
+    from PIL import Image  # lokálně – ať import modulu zůstane rychlý
+
+    sizes: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    for path in paths:
+        try:
+            with Image.open(path) as img:
+                original = (img.width, img.height)
+        except (OSError, ValueError):
+            sizes.append(((0, 0), (0, 0)))
+            continue
+        sizes.append((original, target_size(original[0], original[1], scale)))
+    return sizes
+
+
 def recognize(
     image_paths: Sequence[str],
     language: str = "cs",
     on_progress: Callable[[int, int], None] | None = None,
     log: Callable[[str], None] | None = None,
+    scale: float = 1.0,
 ) -> list[PageText | None]:
     """Rozpozná text ve snímcích. Vrací seznam stejné délky jako `image_paths`.
 
     Položka je `None`, pokud se stránku nepodařilo zpracovat – zbytek dokumentu
-    tím není dotčen.
+    tím není dotčen. `scale` zvětší snímek před rozpoznáváním; souřadnice slov
+    pak platí ve zvětšeném rozměru, který nese `PageText.width/height`.
     """
     paths = [os.path.abspath(p) for p in image_paths]
     if not paths:
         return []
 
-    payload = {"language": language or "", "images": paths}
+    sizes = _scaled_sizes(paths, scale)
+    enlarged = [(orig, tgt) for orig, tgt in sizes if tgt != orig and tgt != (0, 0)]
+    if log and enlarged:
+        orig, tgt = enlarged[0]
+        log(
+            f"OCR: {len(enlarged)} z {len(paths)} stránek se před rozpoznáním zvětší "
+            f"(např. {orig[0]}×{orig[1]} → {tgt[0]}×{tgt[1]} px)"
+        )
+
+    payload = {
+        "language": language or "",
+        "images": [
+            {"path": path, "w": tgt[0], "h": tgt[1]}
+            for path, (_orig, tgt) in zip(paths, sizes)
+        ],
+    }
     timeout = 120.0 + 20.0 * len(paths)
 
     with tempfile.TemporaryDirectory(prefix="rdpscraper_ocr_") as workdir:

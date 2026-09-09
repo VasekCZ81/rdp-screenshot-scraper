@@ -156,6 +156,32 @@ class TestTextGeometry(TextLayerTestCase):
         _size, _tz, x, _y = doc.page_text_positions(0)[0]
         self.assertAlmostEqual(x, 100.0 * 72.0 / 96.0, places=1)
 
+    def test_upscaled_ocr_lands_on_the_same_place(self):
+        """OCR nad 2× zvětšeným snímkem musí dát stejnou pozici jako bez zvětšení."""
+        plain = page_text([("test", 50.0, 25.0, 40.0, 10.0)])
+        upscaled = PageText(
+            width=1800, height=1400,  # OCR běželo nad 2× zvětšenou stránkou 900x700
+            words=(Word("test", 100.0, 50.0, 80.0, 20.0),),
+        )
+        first = PdfDocument.from_file(self.make_pdf([plain])).page_text_positions(0)[0]
+        second = PdfDocument.from_file(self.make_pdf([upscaled])).page_text_positions(0)[0]
+        for value, other in zip(first, second):
+            self.assertAlmostEqual(value, other, places=1)
+
+    def test_upscaled_image_does_not_move_the_text(self):
+        """Zvětšení obrázku pro PDF mění jen počet vzorků, ne geometrii."""
+        layer = page_text([("test", 50.0, 25.0, 40.0, 10.0)])
+        paths = [os.path.join(self.dir, "page_0001.png")]
+        make_text_page(1, (900, 700)).save(paths[0], "PNG")
+
+        positions = []
+        for factor in (1.0, 2.0):
+            pdf = os.path.join(self.dir, f"u{factor}.pdf")
+            images_to_pdf(paths, pdf, dpi=96, text_layers=[layer], upscale=factor)
+            positions.append(PdfDocument.from_file(pdf).page_text_positions(0)[0])
+        for value, other in zip(*positions):
+            self.assertAlmostEqual(value, other, places=3)
+
 
 class TestPlainPdfUnaffected(TextLayerTestCase):
     def test_pdf_without_text_layers_has_no_font(self):
