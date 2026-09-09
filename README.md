@@ -266,7 +266,10 @@ vedle `.exe`.
 | Doostření pro PDF [%] | 0 | 0–300; unsharp mask, rozumně 80–150 |
 | Zvětšení snímku pro OCR | 2 | 1–4×; drobné písmo engine rozpozná spolehlivěji |
 | Adresa RDP relace | *(prázdné)* | **povinné** – podle ní se hledá okno `mstsc.exe` |
-| Metoda odeslání Page Down | sendinput | `sendinput` / `postmessage` |
+| Metoda odeslání kláves | sendinput | `sendinput` / `postmessage` |
+| Klávesa posuvu | pagedown | čím se posouvá dokument |
+| Stisků na jeden posuv | 1 | pevný počet bez kalibrace |
+| Dopočítat počet stisků | vypnuto | samokalibrace podle překryvu |
 | Provést OCR | zapnuto | vyhledatelná textová vrstva v PDF |
 | Jazyk OCR | cs | jazyková značka, např. `cs` nebo `en-GB` |
 | Vymazané oblasti | žádné | obdélníky odstraněné ze všech stránek |
@@ -455,6 +458,57 @@ nedostane ani do vyhledatelné textové vrstvy PDF.
 > **Pořízená PNG zůstávají nedotčená.** Vymazané kopie vznikají vedle nich
 > v podadresáři `masked/`. Když vymazání jakkoli selže, PDF se vytvoří
 > z původních snímků.
+
+---
+
+## Krok posuvu – jak zajistit překryv snímků
+
+Skládání snímků potřebuje, aby se sousední snímky **překrývaly**. Jeden
+`Page Down` ale posune dokument o celou obrazovku nebo víc, takže překryv
+nevznikne vůbec a skládat není podle čeho. Změřeno na skutečném běhu:
+použitelný překryv mělo **0 z 31 spojů**.
+
+Řešení je posouvat po menších krocích: místo jednoho `Page Down` poslat
+několik stisků **šipky dolů**. Krok je pak menší než snímaná oblast a překryv
+vzniká vždy.
+
+### Samokalibrace
+
+Kolik stisků je potřeba, aplikace zjistí sama:
+
+1. první krok pošle **jediný** stisk,
+2. z překryvu obou snímků odečte, o kolik pixelů jeden stisk posune,
+3. dopočítá počet stisků tak, aby krok vyšel na zvolený podíl výšky snímané
+   oblasti (výchozí 85 %),
+4. dál už krok jen **zkracuje** – když překryv zmizí, jde počet stisků
+   na polovinu.
+
+Nahoru se po prvním určení nekoriguje schválně: na konci stránky prohlížeč
+posuv utne, naměřil by se malý posun a přepočet by počet stisků nafukoval
+donekonečna.
+
+Příklad z praxe (oblast vysoká 1814 px, šipka dolů posune 58 px):
+
+```
+Kalibrace posuvu: jeden stisk posune 58 px, krok upraven z 1 na 27 stisků (cíl 1542 px)
+```
+
+Krok pak vyjde na 1566 px, tedy **248 px překryvu** – víc než dost na
+spolehlivé zarovnání.
+
+### Nastavení
+
+| Parametr | Výchozí | Význam |
+|---|---|---|
+| Klávesa posuvu | pagedown | `pagedown`, `down`, `space`, `up`, `pageup`, `right`, `left`, `home`, `end`, `enter` |
+| Stisků na jeden posuv | 1 | pevný počet, když je kalibrace vypnutá |
+| Pauza mezi stisky | 30 ms | aby prohlížeč stihl reagovat |
+| Dopočítat počet stisků | vypnuto | samokalibrace podle překryvu |
+| Cílový krok | 0.85 | podíl výšky snímané oblasti |
+
+> Pro Adobe Reader se osvědčí `down` se zapnutou kalibrací. Cenou je víc
+> snímků na stránku, a tedy delší běh – zato skládání dostane překryv,
+> který potřebuje.
 
 ---
 

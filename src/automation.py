@@ -56,6 +56,75 @@ class RunTargets:
     region: Region
 
 
+class ScrollStep:
+    """Určuje, kolika stisky klávesy se dokument posune o jeden krok.
+
+    Když je zapnutá kalibrace, začíná se jediným stiskem a podle skutečně
+    naměřeného posuvu se počet stisků dopočítá tak, aby krok vyšel na zvolený
+    podíl výšky snímané oblasti. Sousední snímky pak mají překryv, podle
+    kterého je lze spolehlivě poskládat.
+
+    Krok se určí z **prvního** použitelného měření a dál se už nezvětšuje.
+    Prohlížeč na konci stránky posuv utne, takže by tam vyšel malý posuv a
+    přepočet by počet stisků neomezeně nafukoval. Zkrátit krok se ale smí
+    kdykoli – když překryv zmizí, jde počet stisků na polovinu.
+    """
+
+    MAX_PRESSES = 200
+
+    def __init__(self, config: AppConfig, region_height: int) -> None:
+        self.config = config
+        self.target = max(1.0, region_height * config.scroll_target_ratio)
+        self.calibrating = bool(config.scroll_calibrate)
+        self.presses = 1 if self.calibrating else config.scroll_presses
+        self.pixels_per_press: float | None = None
+        self.calibrated = False
+
+    def _clamp(self, value: int) -> int:
+        return max(1, min(self.MAX_PRESSES, int(value)))
+
+    def observe(self, shift: int | None) -> str | None:
+        """Zohlední naměřený posuv. Vrací hlášku do logu, pokud se krok změnil."""
+        if not self.calibrating:
+            return None
+
+        if shift is None or shift <= 0:
+            if self.presses <= 1:
+                self.calibrating = False
+                return (
+                    "Kalibrace posuvu: ani jediný stisk nedává použitelný překryv, "
+                    "krok zůstává na 1 stisku"
+                )
+            before = self.presses
+            self.presses = self._clamp(self.presses // 2)
+            self.pixels_per_press = None
+            return (
+                f"Kalibrace posuvu: překryv zmizel, zkracuji krok z {before} "
+                f"na {self.presses} stisků"
+            )
+
+        if self.calibrated:
+            # Krok už je určený. Nahoru se nekoriguje: na konci stránky
+            # prohlížeč posuv utne a z takového měření by vyšel nesmysl.
+            return None
+
+        self.pixels_per_press = shift / self.presses
+        wanted = self._clamp(round(self.target / self.pixels_per_press))
+        self.calibrated = True
+        if wanted == self.presses:
+            return (
+                f"Kalibrace posuvu: jeden stisk posune {self.pixels_per_press:.0f} px, "
+                f"krok zůstává na {wanted} stisku"
+            )
+        before = self.presses
+        self.presses = wanted
+        return (
+            f"Kalibrace posuvu: jeden stisk posune {self.pixels_per_press:.0f} px, "
+            f"krok upraven z {before} na {wanted} stisků "
+            f"(cíl {self.target:.0f} px)"
+        )
+
+
 def capture_verified(
     tc_hwnd: int,
     region: Region,
@@ -415,6 +484,13 @@ class AutomationController:
     def _loop(self, capturer: ScreenCapturer) -> None:
         cfg = self.config
 
+        step = ScrollStep(cfg, self.targets.region.height)
+        if cfg.scroll_calibrate:
+            self._log(
+                "Kalibrace posuvu zapnuta – počet stisků se dopočítá z prvního "
+                f"naměřeného posuvu (cíl {step.target:.0f} px)"
+            )
+
         # Krok 0 – výchozí pozice dokumentu (aktivace TC + ověření + snímek)
         previous = self._capture_with_total_commander(capturer)
         self._save_page(previous)
@@ -447,10 +523,19 @@ class AutomationController:
                     "RDP přestalo být aktivním oknem – Page Down nebyl odeslán."
                 )
             try:
-                wm.send_page_down(self.targets.rdp_hwnd, cfg.page_down_method)
-            except OSError as exc:
-                raise AutomationError(f"Odeslání Page Down selhalo: {exc}") from exc
-            self._log("Page Down")
+                wm.send_key(
+                    self.targets.rdp_hwnd,
+                    cfg.scroll_key,
+                    cfg.page_down_method,
+                    presses=step.presses,
+                    delay_ms=cfg.scroll_press_delay_ms,
+                )
+            except (OSError, ValueError) as exc:
+                raise AutomationError(f"Odeslání klávesy posuvu selhalo: {exc}") from exc
+            self._log(
+                cfg.scroll_key
+                + (f" ×{step.presses}" if step.presses > 1 else "")
+            )
 
             # Krok 3 – čekání na překreslení obsahu
             self._sleep(cfg.page_down_delay_ms / 1000.0)
@@ -459,6 +544,12 @@ class AutomationController:
 
             # Krok 4 – zpět na Total Commander, ověřit a teprve pak snímat
             current = self._capture_with_total_commander(capturer)
+
+            if step.calibrating:
+                measured, _error = stitch.find_shift(previous, current)
+                message = step.observe(measured)
+                if message:
+                    self._log(message)
 
             # Krok 5 – porovnání s předchozím snímkem
             result = compare(

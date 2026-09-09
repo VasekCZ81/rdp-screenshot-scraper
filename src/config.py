@@ -88,6 +88,13 @@ class AppConfig:
     # (uloží se do config.json). Bez ní se snímání nespustí.
     rdp_host: str = ""
     page_down_method: str = "sendinput"  # "sendinput" | "postmessage"
+
+    # --- posuv dokumentu ---
+    scroll_key: str = "pagedown"         # klávesa, kterou se posouvá
+    scroll_presses: int = 1              # kolik stisků na jeden krok
+    scroll_press_delay_ms: int = 30      # pauza mezi opakovanými stisky
+    scroll_calibrate: bool = False       # dopočítat počet stisků z překryvu
+    scroll_target_ratio: float = 0.85    # cílový krok jako podíl výšky oblasti
     pdf_dpi: int = 96                    # DPI použité pro velikost stránky PDF
     # Fyzická šířka snímané předlohy v mm. Kladná hodnota má přednost před
     # pdf_dpi – rozlišení stránky se dopočítá ze šířky snímku (A4 = 210).
@@ -129,6 +136,14 @@ class AppConfig:
         self.pdf_page_width_mm = max(0.0, min(2000.0, float(self.pdf_page_width_mm)))
         if self.page_down_method not in ("sendinput", "postmessage"):
             self.page_down_method = "sendinput"
+        import window_manager as wm_mod
+
+        key = str(self.scroll_key).strip().lower()
+        self.scroll_key = key if key in wm_mod.SCROLL_KEYS else wm_mod.DEFAULT_SCROLL_KEY
+        self.scroll_presses = max(1, min(200, int(self.scroll_presses)))
+        self.scroll_press_delay_ms = max(0, min(1000, int(self.scroll_press_delay_ms)))
+        self.scroll_calibrate = bool(self.scroll_calibrate)
+        self.scroll_target_ratio = max(0.2, min(0.98, float(self.scroll_target_ratio)))
         # Prázdná adresa je platný stav – znamená „uživatel ještě nezadal“.
         self.rdp_host = str(self.rdp_host).strip()
         import mask as mask_mod

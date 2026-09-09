@@ -1,4 +1,4 @@
-﻿"""Testy exportu do PDF."""
+"""Testy exportu do PDF."""
 
 from __future__ import annotations
 

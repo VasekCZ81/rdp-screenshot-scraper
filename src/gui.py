@@ -262,6 +262,9 @@ class SettingsDialog(tk.Toplevel):
         ("pdf_sharpen", "Doostření pro PDF [%] (0 = vypnuto)", float),
         ("ocr_upscale", "Zvětšení snímku pro OCR (1 = vypnuto)", float),
         ("rdp_host", "Adresa RDP relace (povinné)", str),
+        ("scroll_presses", "Stisků klávesy na jeden posuv", int),
+        ("scroll_press_delay_ms", "Pauza mezi stisky [ms]", int),
+        ("scroll_target_ratio", "Cílový krok (podíl výšky oblasti)", float),
     ]
 
     def __init__(
@@ -297,6 +300,39 @@ class SettingsDialog(tk.Toplevel):
         for key in ("pdf_dpi", "pdf_page_width_mm", "pdf_upscale"):
             self._vars[key].trace_add("write", lambda *_a: self._update_dpi_hint())
         self._update_dpi_hint()
+
+        row += 1
+        self._scroll_key = tk.StringVar(value=config.scroll_key)
+        ttk.Label(frame, text="Klávesa posuvu dokumentu").grid(
+            row=row, column=0, sticky="w", pady=2
+        )
+        ttk.Combobox(
+            frame,
+            textvariable=self._scroll_key,
+            values=sorted(wm.SCROLL_KEYS),
+            state="readonly",
+            width=16,
+        ).grid(row=row, column=1, sticky="e", padx=(PAD, 0), pady=2)
+
+        row += 1
+        self._scroll_calibrate = tk.BooleanVar(value=config.scroll_calibrate)
+        ttk.Checkbutton(
+            frame,
+            text="Dopočítat počet stisků z naměřeného posuvu",
+            variable=self._scroll_calibrate,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
+
+        row += 1
+        ttk.Label(
+            frame,
+            text=(
+                "Skládání snímků potřebuje, aby se sousední snímky překrývaly.\n"
+                "Jeden Page Down bývá na celou obrazovku, proto zvolte menší\n"
+                "klávesu (šipka dolů) a nechte si počet stisků dopočítat."
+            ),
+            foreground="#555555",
+            justify="left",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
 
         row += 1
         self._method = tk.StringVar(value=config.page_down_method)
@@ -477,6 +513,8 @@ class SettingsDialog(tk.Toplevel):
         for key, value in values.items():
             setattr(self.config_obj, key, value)
         self.config_obj.page_down_method = self._method.get()
+        self.config_obj.scroll_key = self._scroll_key.get()
+        self.config_obj.scroll_calibrate = bool(self._scroll_calibrate.get())
         self.config_obj.save_duplicates = bool(self._save_dups.get())
         self.config_obj.stitch_enabled = bool(self._stitch_enabled.get())
         self.config_obj.ocr_enabled = bool(self._ocr_enabled.get())

@@ -1,4 +1,4 @@
-﻿"""Testy konfigurace, cest a validace snímané oblasti."""
+"""Testy konfigurace, cest a validace snímané oblasti."""
 
 from __future__ import annotations
 

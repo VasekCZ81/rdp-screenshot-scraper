@@ -1,4 +1,4 @@
-﻿"""Testy Win32 vrstvy, které lze provést bez cizích oken."""
+"""Testy Win32 vrstvy, které lze provést bez cizích oken."""
 
 from __future__ import annotations
 

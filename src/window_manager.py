@@ -29,6 +29,23 @@ SW_SHOW = 5
 GA_ROOT = 2
 
 VK_NEXT = 0x22  # Page Down
+
+# Klávesy, kterými lze posouvat dokument. Rozšířené klávesy (šipky, Page Down,
+# Home/End) potřebují příznak KEYEVENTF_EXTENDEDKEY, jinak je cíl dostane jako
+# jejich protějšky z numerické klávesnice.
+SCROLL_KEYS = {
+    "pagedown": (0x22, True),
+    "pageup": (0x21, True),
+    "down": (0x28, True),
+    "up": (0x26, True),
+    "left": (0x25, True),
+    "right": (0x27, True),
+    "home": (0x24, True),
+    "end": (0x23, True),
+    "space": (0x20, False),
+    "enter": (0x0D, False),
+}
+DEFAULT_SCROLL_KEY = "pagedown"
 KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 INPUT_KEYBOARD = 1
@@ -394,22 +411,46 @@ def ensure_foreground(
 # ------------------------------------------------------------------------
 def send_page_down(hwnd: int, method: str = "sendinput") -> None:
     """Odešle Page Down. Volající MUSÍ mít předem ověřený foreground `hwnd`."""
-    if method == "postmessage":
-        _send_page_down_postmessage(hwnd)
-    else:
-        _send_page_down_input()
+    send_key(hwnd, DEFAULT_SCROLL_KEY, method)
 
 
-def _send_page_down_input() -> None:
+def send_key(
+    hwnd: int,
+    key: str = DEFAULT_SCROLL_KEY,
+    method: str = "sendinput",
+    presses: int = 1,
+    delay_ms: int = 0,
+) -> None:
+    """Odešle klávesu, případně několikrát za sebou.
+
+    Volající MUSÍ mít předem ověřený foreground `hwnd`. Opakovaným stiskem
+    menší klávesy (typicky šipky dolů) se dá posouvat po malých krocích, takže
+    sousední snímky mají překryv a dají se poskládat.
+    """
+    name = (key or DEFAULT_SCROLL_KEY).strip().lower()
+    if name not in SCROLL_KEYS:
+        raise ValueError(f"Neznámá klávesa posuvu: {key!r}")
+    code, extended = SCROLL_KEYS[name]
+    for index in range(max(1, int(presses))):
+        if index and delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+        if method == "postmessage":
+            _send_key_postmessage(hwnd, code, extended)
+        else:
+            _send_key_input(code, extended)
+
+
+def _send_key_input(code: int, extended: bool) -> None:
     """SendInput – jediná metoda, kterou klient RDP spolehlivě přenese do relace."""
-    scan = user32.MapVirtualKeyW(VK_NEXT, 0)
+    scan = user32.MapVirtualKeyW(code, 0)
+    base = KEYEVENTF_EXTENDEDKEY if extended else 0
 
     def _make(flags: int) -> INPUT:
         return INPUT(
             type=INPUT_KEYBOARD,
             u=_INPUTunion(
                 ki=KEYBDINPUT(
-                    wVk=VK_NEXT,
+                    wVk=code,
                     wScan=scan,
                     dwFlags=flags,
                     time=0,
@@ -418,23 +459,20 @@ def _send_page_down_input() -> None:
             ),
         )
 
-    events = (INPUT * 2)(
-        _make(KEYEVENTF_EXTENDEDKEY),
-        _make(KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
-    )
+    events = (INPUT * 2)(_make(base), _make(base | KEYEVENTF_KEYUP))
     sent = user32.SendInput(2, events, ctypes.sizeof(INPUT))
     if sent != 2:
         raise OSError(f"SendInput odeslal {sent} z 2 událostí (chyba {ctypes.get_last_error()})")
 
 
-def _send_page_down_postmessage(hwnd: int) -> None:
-    scan = user32.MapVirtualKeyW(VK_NEXT, 0)
-    lparam_down = 1 | (scan << 16) | (1 << 24)
+def _send_key_postmessage(hwnd: int, code: int, extended: bool) -> None:
+    scan = user32.MapVirtualKeyW(code, 0)
+    lparam_down = 1 | (scan << 16) | ((1 << 24) if extended else 0)
     lparam_up = lparam_down | (1 << 30) | (1 << 31)
     target = _focused_hwnd_of(hwnd) or hwnd
-    if not user32.PostMessageW(target, WM_KEYDOWN, VK_NEXT, lparam_down):
+    if not user32.PostMessageW(target, WM_KEYDOWN, code, lparam_down):
         raise OSError(f"PostMessage WM_KEYDOWN selhal (chyba {ctypes.get_last_error()})")
-    if not user32.PostMessageW(target, WM_KEYUP, VK_NEXT, lparam_up):
+    if not user32.PostMessageW(target, WM_KEYUP, code, lparam_up):
         raise OSError(f"PostMessage WM_KEYUP selhal (chyba {ctypes.get_last_error()})")
 
 
