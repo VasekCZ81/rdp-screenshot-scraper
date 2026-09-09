@@ -20,6 +20,7 @@ from enum import Enum
 from typing import Callable
 
 import config as cfg_mod
+import mask as mask_mod
 import ocr
 import stitch
 import window_manager as wm
@@ -35,6 +36,7 @@ class Status(str, Enum):
     RUNNING = "Probíhá snímání"
     PAUSED = "Pozastaveno"
     END_DETECTED = "Detekován konec dokumentu"
+    MASKING = "Vymazávám oblast"
     STITCHING = "Skládám snímky"
     OCR = "Provádím OCR"
     MAKING_PDF = "Vytvářím PDF"
@@ -52,6 +54,87 @@ class RunTargets:
     rdp_hwnd: int
     rdp_label: str
     region: Region
+
+
+def capture_verified(
+    tc_hwnd: int,
+    region: Region,
+    capturer: ScreenCapturer,
+    config: AppConfig,
+    log: Callable[[str], None] | None = None,
+    warn: Callable[[str], None] | None = None,
+):
+    """JEDINÉ místo v aplikaci, kde vzniká screenshot.
+
+    Aktivuje Total Commander, ověří přes `GetForegroundWindow()`, že je
+    skutečně aktivním oknem, a teprve pak snímá. Když ověření neprojde,
+    snímek NEVZNIKNE a vyhodí se `AutomationError`.
+    """
+    if not wm.is_window(tc_hwnd):
+        raise AutomationError("Okno Total Commanderu bylo zavřeno.")
+
+    if not wm.ensure_foreground(
+        tc_hwnd,
+        activation_delay_ms=config.activation_delay_ms,
+        attempts=config.activation_attempts,
+        retry_ms=config.activation_retry_ms,
+        log=warn or log,
+    ):
+        raise AutomationError(
+            "Nepodařilo se aktivovat Total Commander – screenshot nebyl pořízen."
+        )
+    if log:
+        log(f"Total Commander aktivován (HWND {tc_hwnd})")
+
+    # Poslední kontrola těsně před snímkem. Bez ní se nesnímá.
+    if not wm.is_foreground(tc_hwnd):
+        raise AutomationError(
+            "Total Commander přestal být aktivním oknem – screenshot nebyl pořízen."
+        )
+    return capturer.grab(region)
+
+
+def capture_single(
+    config: AppConfig,
+    tc_hwnd: int,
+    region: Region,
+    log: Callable[[str], None] | None = None,
+):
+    """Pořídí jeden ověřený snímek – pro náhled a výběr oblasti k vymazání."""
+    validate_region(region)
+    capturer = ScreenCapturer()
+    try:
+        return capture_verified(tc_hwnd, region, capturer, config, log=log)
+    finally:
+        capturer.close()
+
+
+def mask_captures(
+    config: AppConfig,
+    page_files: list[str],
+    session_dir: str,
+    status: Callable[[str], None] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Vymaže zvolené oblasti ze všech snímků. Vrací cesty pro další zpracování.
+
+    Uplatňuje se před skládáním i před OCR: souřadnice masky platí v rámci
+    snímané oblasti a vymazaný text se tak nedostane ani do textové vrstvy.
+    Při jakémkoli selhání se vrátí původní snímky, aby PDF vzniklo jako dosud.
+    """
+    rects = mask_mod.normalize_rects(config.mask_rects)
+    if not rects or not page_files:
+        return page_files
+
+    out_dir = os.path.join(session_dir, cfg_mod.MASKED_DIRNAME)
+    try:
+        if status:
+            status(Status.MASKING.value)
+        return mask_mod.apply_masks(page_files, rects, out_dir, log=log)
+    except (mask_mod.MaskError, OSError, ValueError) as exc:
+        if log:
+            log(f"Vymazání oblasti selhalo, snímky zůstávají beze změny: {exc}")
+        return page_files
 
 
 def stitch_captures(
@@ -250,21 +333,6 @@ class AutomationController:
     # ------------------------------------------------------------------
     # Kritická sekce – aktivace + ověření + snímek
     # ------------------------------------------------------------------
-    def _activate_total_commander(self) -> bool:
-        hwnd = self.targets.tc_hwnd
-        if not wm.is_window(hwnd):
-            raise AutomationError("Okno Total Commanderu bylo zavřeno.")
-        ok = wm.ensure_foreground(
-            hwnd,
-            activation_delay_ms=self.config.activation_delay_ms,
-            attempts=self.config.activation_attempts,
-            retry_ms=self.config.activation_retry_ms,
-            log=lambda m: self.log.warning(m),
-        )
-        if ok:
-            self._log(f"Total Commander aktivován (HWND {hwnd})")
-        return ok
-
     def _activate_rdp(self) -> bool:
         hwnd = self.targets.rdp_hwnd
         if not wm.is_window(hwnd):
@@ -281,23 +349,15 @@ class AutomationController:
         return ok
 
     def _capture_with_total_commander(self, capturer: ScreenCapturer):
-        """JEDINÉ místo v aplikaci, kde vzniká screenshot.
-
-        Vrací PIL.Image. Vyhodí AutomationError, pokud Total Commander není
-        prokazatelně aktivním oknem – v takovém případě snímek nevznikne.
-        """
-        if not self._activate_total_commander():
-            raise AutomationError(
-                "Nepodařilo se aktivovat Total Commander – screenshot nebyl pořízen."
-            )
-
-        # Poslední kontrola těsně před snímkem. Bez ní se nesnímá.
-        if not wm.is_foreground(self.targets.tc_hwnd):
-            raise AutomationError(
-                "Total Commander přestal být aktivním oknem – screenshot nebyl pořízen."
-            )
-
-        image = capturer.grab(self.targets.region)
+        """Snímek přes společnou `capture_verified()` – jediné místo s tímto právem."""
+        image = capture_verified(
+            self.targets.tc_hwnd,
+            self.targets.region,
+            capturer,
+            self.config,
+            log=self._log,
+            warn=lambda m: self.log.warning(m),
+        )
         self.captured_total += 1
         return image
 
@@ -510,9 +570,17 @@ class AutomationController:
         name = os.path.basename(self.session_dir.rstrip("\\/"))
         pdf_path = os.path.join(self.session_dir, f"RDP_capture_{name}.pdf")
 
-        pages = stitch_captures(
+        pages = mask_captures(
             self.config,
             self.page_files,
+            self.session_dir,
+            status=lambda text: self.emit("status", text),
+            log=self._log,
+        )
+
+        pages = stitch_captures(
+            self.config,
+            pages,
             self.session_dir,
             status=lambda text: self.emit("status", text),
             log=self._log,

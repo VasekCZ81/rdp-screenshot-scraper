@@ -5,24 +5,31 @@ from __future__ import annotations
 import os
 import queue
 import subprocess
+import tempfile
 import threading
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import config as cfg_mod
 import hotkey as hotkey_mod
+import mask as mask_mod
 import ocr
 import window_manager as wm
+import automation
 from automation import (
     AutomationController,
+    AutomationError,
     RunTargets,
     Status,
     close_logger,
     ocr_pages,
+    mask_captures,
     stitch_captures,
     setup_session_logger,
 )
-from capture import Region
+from PIL import Image
+
+from capture import CaptureError, Region
 from config import APP_NAME, AppConfig
 from pdf_export import PdfExportError, dpi_for_width, images_to_pdf
 from region_selector import select_region
@@ -77,6 +84,162 @@ class WindowPicker(tk.Toplevel):
     def _cancel(self) -> None:
         self.result = None
         self.destroy()
+
+
+class MaskDialog(tk.Toplevel):
+    """Vyznačení oblastí, které se vymažou ze všech stránek.
+
+    Pracuje nad snímkem první stránky. Souřadnice se ukládají v pixelech
+    snímané oblasti, takže platí pro každou další stránku stejně.
+    """
+
+    MAX_WIDTH = 1100
+    MAX_HEIGHT = 760
+
+    def __init__(self, master: tk.Misc, image, rects: list[mask_mod.MaskRect]) -> None:
+        super().__init__(master)
+        self.title("Oblast k vymazání ze všech stránek")
+        self.resizable(False, False)
+        self.result: list[mask_mod.MaskRect] | None = None
+        self._rects = list(rects)
+        self._image_size = image.size
+        self._start: tuple[int, int] | None = None
+        self._drag_id: int | None = None
+
+        width, height = image.size
+        self._scale = min(1.0, self.MAX_WIDTH / width, self.MAX_HEIGHT / height)
+        view = image
+        if self._scale < 1.0:
+            view = image.resize(
+                (max(1, int(width * self._scale)), max(1, int(height * self._scale))),
+                Image.Resampling.LANCZOS,
+            )
+
+        # Tk 8.6 umí PNG načíst přímo, takže není potřeba PIL.ImageTk.
+        self._tempdir = tempfile.TemporaryDirectory(prefix="rdpscraper_mask_")
+        preview_path = os.path.join(self._tempdir.name, "preview.png")
+        view.save(preview_path, "PNG")
+        self._photo = tk.PhotoImage(file=preview_path)
+
+        ttk.Label(
+            self,
+            text=(
+                "Tažením myši označte oblast, která se má na všech stránkách "
+                "nahradit bílou plochou.\nMůžete označit i více oblastí."
+            ),
+            justify="left",
+        ).pack(anchor="w", padx=PAD, pady=(PAD, 4))
+
+        self.canvas = tk.Canvas(
+            self,
+            width=self._photo.width(),
+            height=self._photo.height(),
+            highlightthickness=1,
+            highlightbackground="#808080",
+            cursor="crosshair",
+        )
+        self.canvas.pack(padx=PAD)
+        self.canvas.create_image(0, 0, anchor="nw", image=self._photo)
+
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.bind("<Escape>", lambda _e: self._cancel())
+
+        self.var_info = tk.StringVar()
+        ttk.Label(self, textvariable=self.var_info, foreground="#555555").pack(
+            anchor="w", padx=PAD, pady=(4, 0)
+        )
+
+        row = ttk.Frame(self)
+        row.pack(fill="x", padx=PAD, pady=PAD)
+        ttk.Button(row, text="Použít", command=self._ok).pack(side="right")
+        ttk.Button(row, text="Zrušit", command=self._cancel).pack(side="right", padx=(0, 6))
+        ttk.Button(row, text="Smazat vše", command=self._clear).pack(side="left")
+        ttk.Button(row, text="Zpět", command=self._undo).pack(side="left", padx=(6, 0))
+
+        self._redraw()
+        self.transient(master)
+        self.grab_set()
+
+    # ------------------------------------------------------------------
+    def _to_image(self, x: int, y: int) -> tuple[int, int]:
+        return int(round(x / self._scale)), int(round(y / self._scale))
+
+    def _to_view(self, x: int, y: int) -> tuple[float, float]:
+        return x * self._scale, y * self._scale
+
+    def _redraw(self) -> None:
+        self.canvas.delete("mask")
+        for rect in self._rects:
+            left, top = self._to_view(rect.x, rect.y)
+            right, bottom = self._to_view(rect.x + rect.width, rect.y + rect.height)
+            self.canvas.create_rectangle(
+                left, top, right, bottom,
+                fill="white", stipple="gray50", outline="#D00000", width=2,
+                tags="mask",
+            )
+        width, height = self._image_size
+        self.var_info.set(
+            f"Snímek {width}x{height} px, náhled {self._scale * 100:.0f} %   |   "
+            f"označených oblastí: {len(self._rects)}"
+        )
+
+    def _on_press(self, event: tk.Event) -> None:
+        self._start = (event.x, event.y)
+        if self._drag_id is not None:
+            self.canvas.delete(self._drag_id)
+        self._drag_id = self.canvas.create_rectangle(
+            event.x, event.y, event.x, event.y, outline="#D00000", width=2, dash=(4, 3)
+        )
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._start is None or self._drag_id is None:
+            return
+        self.canvas.coords(self._drag_id, self._start[0], self._start[1], event.x, event.y)
+
+    def _on_release(self, event: tk.Event) -> None:
+        if self._start is None:
+            return
+        if self._drag_id is not None:
+            self.canvas.delete(self._drag_id)
+            self._drag_id = None
+        left, right = sorted((self._start[0], event.x))
+        top, bottom = sorted((self._start[1], event.y))
+        self._start = None
+        if right - left < 3 or bottom - top < 3:
+            return
+        x0, y0 = self._to_image(left, top)
+        x1, y1 = self._to_image(right, bottom)
+        rect = mask_mod.MaskRect(x0, y0, x1 - x0, y1 - y0).clipped(*self._image_size)
+        if rect is not None:
+            self._rects.append(rect)
+        self._redraw()
+
+    def _undo(self) -> None:
+        if self._rects:
+            self._rects.pop()
+            self._redraw()
+
+    def _clear(self) -> None:
+        self._rects = []
+        self._redraw()
+
+    def _ok(self) -> None:
+        self.result = list(self._rects)
+        self._close()
+
+    def _cancel(self) -> None:
+        self.result = None
+        self._close()
+
+    def _close(self) -> None:
+        try:
+            self.grab_release()
+        except tk.TclError:
+            pass
+        self.destroy()
+        self._tempdir.cleanup()
 
 
 class SettingsDialog(tk.Toplevel):
@@ -354,6 +517,7 @@ class ScraperApp(tk.Tk):
 
         self._build_ui()
         self.refresh_windows()
+        self._update_mask_label()
         self._update_buttons()
 
         self.hotkey = hotkey_mod.EmergencyHotkey(self._on_hotkey)
@@ -436,6 +600,14 @@ class ScraperApp(tk.Tk):
             )
         self.btn_region = ttk.Button(box2, text="Vybrat oblast", command=self._select_region)
         self.btn_region.grid(row=0, column=5, sticky="e")
+        self.var_mask = tk.StringVar(value="Vymazané oblasti: 0")
+        ttk.Label(box2, textvariable=self.var_mask).grid(
+            row=1, column=0, columnspan=4, sticky="w", pady=(6, 0)
+        )
+        self.btn_mask = ttk.Button(
+            box2, text="Vymazat oblast…", command=self._select_mask
+        )
+        self.btn_mask.grid(row=1, column=5, sticky="e", pady=(6, 0))
 
         # --- stav automatizace ---
         box3 = ttk.LabelFrame(root, text="Stav automatizace", padding=PAD)
@@ -605,6 +777,73 @@ class ScraperApp(tk.Tk):
         self._update_buttons()
 
     # ------------------------------------------------------------------
+    # Oblast k vymazání
+    # ------------------------------------------------------------------
+    def _mask_rects(self) -> list:
+        return mask_mod.normalize_rects(self.config_obj.mask_rects)
+
+    def _update_mask_label(self) -> None:
+        count = len(self._mask_rects())
+        self.var_mask.set(
+            "Vymazané oblasti: žádná" if not count else f"Vymazané oblasti: {count}"
+        )
+
+    def _mask_source_image(self):
+        """Snímek první stránky – čerstvý, jinak z poslední relace."""
+        if self.tc_window is not None and self.region is not None:
+            try:
+                return automation.capture_single(
+                    self.config_obj,
+                    self.tc_window.hwnd,
+                    self.region,
+                    log=lambda message: self._emit("log", message),
+                ), "čerstvý snímek"
+            except (AutomationError, CaptureError) as exc:
+                self._append_log(f"Náhled se nepodařilo pořídit: {exc}")
+        pages, _session = self._collect_pages()
+        if pages:
+            with Image.open(pages[0]) as stored:
+                return stored.convert("RGB"), os.path.basename(pages[0])
+        return None, ""
+
+    def _select_mask(self) -> None:
+        if self._automation_active() or self._busy:
+            return
+        if self.region is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Nejprve vyberte snímanou oblast – podle ní se určuje, "
+                "co se má na stránkách vymazat.",
+            )
+            return
+
+        image, source = self._mask_source_image()
+        if image is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Nepodařilo se získat snímek první stránky.\n\n"
+                "Zkontrolujte, že běží Total Commander, nebo nejdřív pořiďte "
+                "aspoň jeden snímek.",
+            )
+            return
+
+        self._append_log(f"Výběr oblasti k vymazání ({source})")
+        dialog = MaskDialog(self, image, self._mask_rects())
+        image.close()
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        self.config_obj.mask_rects = mask_mod.rects_to_config(dialog.result)
+        self.config_obj.save()
+        self._update_mask_label()
+        if dialog.result:
+            self._append_log(
+                "K vymazání: " + ", ".join(str(rect) for rect in dialog.result)
+            )
+        else:
+            self._append_log("Vymazávání oblastí zrušeno.")
+
+    # ------------------------------------------------------------------
     # Automatizace
     # ------------------------------------------------------------------
     def _automation_active(self) -> bool:
@@ -759,9 +998,16 @@ class ScraperApp(tk.Tk):
 
         def worker() -> None:
             try:
-                sources = stitch_captures(
+                sources = mask_captures(
                     self.config_obj,
                     pages,
+                    session_dir,
+                    status=lambda text: self._emit("status", text),
+                    log=lambda message: self._emit("log", message),
+                )
+                sources = stitch_captures(
+                    self.config_obj,
+                    sources,
                     session_dir,
                     status=lambda text: self._emit("status", text),
                     log=lambda message: self._emit("log", message),
@@ -937,6 +1183,9 @@ class ScraperApp(tk.Tk):
         )
         self.btn_pick_tc.configure(state="disabled" if running else "normal")
         self.btn_pick_rdp.configure(state="disabled" if running else "normal")
+        self.btn_mask.configure(
+            state="disabled" if (running or self._busy) else "normal"
+        )
 
     # ------------------------------------------------------------------
     def _on_close(self) -> None:

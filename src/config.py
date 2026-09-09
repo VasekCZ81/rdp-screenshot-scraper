@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 
 APP_NAME = "RDP Screenshot Scraper"
@@ -17,6 +17,7 @@ CONFIG_FILENAME = "config.json"
 CAPTURES_DIRNAME = "captures"
 LOG_FILENAME = "scraper.log"
 DUPLICATES_DIRNAME = "duplicates"
+MASKED_DIRNAME = "masked"
 STITCHED_DIRNAME = "stitched"
 PAGE_PREFIX = "page_"
 PAGE_DIGITS = 4
@@ -98,6 +99,10 @@ class AppConfig:
     pdf_sharpen: float = 0.0
     save_duplicates: bool = True         # ukládat potvrzovací duplicity do duplicates/
 
+    # --- vymazání oblasti ze všech stránek ---
+    # Obdélníky [x, y, šířka, výška] v pixelech snímané oblasti.
+    mask_rects: list = field(default_factory=list)
+
     # --- skládání snímků (zoom v prohlížeči > jedna obrazovka na stránku) ---
     stitch_enabled: bool = False         # složit překrývající se snímky do stránek
     stitch_page_height_px: int = 0       # 0 = poměr A4 podle šířky pásu
@@ -126,6 +131,11 @@ class AppConfig:
             self.page_down_method = "sendinput"
         # Prázdná adresa je platný stav – znamená „uživatel ještě nezadal“.
         self.rdp_host = str(self.rdp_host).strip()
+        import mask as mask_mod
+
+        self.mask_rects = mask_mod.rects_to_config(
+            mask_mod.normalize_rects(self.mask_rects)
+        )
         self.stitch_enabled = bool(self.stitch_enabled)
         self.stitch_page_height_px = max(0, min(60000, int(self.stitch_page_height_px)))
         self.ocr_enabled = bool(self.ocr_enabled)

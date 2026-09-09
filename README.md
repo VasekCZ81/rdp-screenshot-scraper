@@ -160,6 +160,9 @@ captures/
         duplicates/
             dup_0001.png          <- potvrzení konce, do PDF se nedostane
             dup_0002.png
+        masked/                   <- jen když je vybraná oblast k vymazání
+            page_0001.png
+            page_0002.png
         stitched/                 <- jen když je zapnuté skládání snímků
             page_0001.png
             page_0002.png
@@ -173,6 +176,9 @@ captures/
   zachovaným poměrem stran. Obrázky se vkládají **bezeztrátově** (`FlateDecode`),
   bez JPEG rekomprese – text na screenshotech zůstane ostrý.
 * V PDF je navíc **vyhledatelný text z OCR** – viz níže.
+* Pořadí zpracování: pořízené snímky → vymazání oblastí → skládání →
+  OCR → PDF. Každý krok je volitelný a při selhání se přeskočí, takže
+  PDF vznikne vždy.
 
 ---
 
@@ -263,6 +269,7 @@ vedle `.exe`.
 | Metoda odeslání Page Down | sendinput | `sendinput` / `postmessage` |
 | Provést OCR | zapnuto | vyhledatelná textová vrstva v PDF |
 | Jazyk OCR | cs | jazyková značka, např. `cs` nebo `en-GB` |
+| Vymazané oblasti | žádné | obdélníky odstraněné ze všech stránek |
 | Skládat snímky | vypnuto | složit překrývající se snímky do celých stránek |
 | Výška složené stránky | 0 | 0 = poměr A4 podle šířky pásu |
 
@@ -394,6 +401,56 @@ strana B → Page Down → strana B    (potvrzení 2/2 → konec)
 Duplicitní závěrečné snímky se do PDF nedostanou. Ukládají se pouze
 diagnosticky do podadresáře `duplicates/` (lze vypnout v nastavení).
 
+## Snímání PDF otevřeného v Adobe Readeru
+
+Typické nasazení: v RDP relaci běží Adobe Reader s otevřeným PDF a aplikace
+snímá **celou stránku** dokumentu, stránku po stránce.
+
+### Nastavení Adobe Readeru
+
+1. **Zobrazení → Zobrazení stránky → Jedna stránka** *(nikoli souvislé
+   posouvání)*. `Page Down` pak přejde přesně o jednu stránku a jeden snímek
+   odpovídá jedné stránce dokumentu.
+2. **Zobrazení → Zvětšení → Přizpůsobit stránku** – celá stránka je vidět naráz.
+3. **Zobrazení → Režim čtení** (`Ctrl+H`) skryje panely nástrojů a nechá
+   dokumentu víc místa. Ostatní panely lze zavřít přes `F4`.
+4. Snímanou oblast pak označte tak, aby obsahovala jen stránku dokumentu,
+   bez okrajů okna a bez posuvníku.
+
+> Chcete-li ostřejší obraz než dovolí „Přizpůsobit stránku“, zvětšete zoom na
+> šířku stránky a zapněte **skládání snímků** – viz sekce níže.
+
+### Vymazání oblasti ze všech stránek
+
+Opakuje-li se na každé stránce něco, co ve výstupu nechcete – vodoznak,
+hlavička, patička, číslo stránky, zbytek lišty Readeru – označte to **jednou
+na první stránce** a aplikace to odstraní ze **všech** stránek. Vymazané místo
+zůstane bílé.
+
+Postup:
+
+1. Vyberte snímanou oblast (`Vybrat oblast`).
+2. Klikněte na **`Vymazat oblast…`**. Aplikace pořídí snímek první stránky
+   (přes stejné ověření aktivního Total Commanderu jako při snímání) a zobrazí
+   ho zmenšený.
+3. Tažením myši označte, co se má vymazat. Můžete označit i více oblastí,
+   tlačítko **Zpět** vezme poslední zpět, **Smazat vše** začne znovu.
+4. **Použít** volbu uloží do `config.json`, takže platí i pro další spuštění.
+   Počet oblastí je vidět v hlavním okně.
+
+Souřadnice se ukládají v pixelech **snímané oblasti**, takže platí pro každou
+stránku stejně. Když ještě nemáte spuštěný Total Commander, dialog nabídne
+místo čerstvého snímku první stránku z poslední relace.
+
+Maska se uplatní **před OCR i před skládáním**, takže se vymazaný text
+nedostane ani do vyhledatelné textové vrstvy PDF.
+
+> **Pořízená PNG zůstávají nedotčená.** Vymazané kopie vznikají vedle nich
+> v podadresáři `masked/`. Když vymazání jakkoli selže, PDF se vytvoří
+> z původních snímků.
+
+---
+
 ## Skládání snímků – jak dostat vyšší kvalitu
 
 Výška obrazovky je tvrdý strop kvality. Celá A4 se do výšky 2079 px vejde
@@ -489,6 +546,7 @@ rdp-screenshot-scraper/
 │   ├── region_selector.py  fullscreen overlay pro výběr oblasti myší
 │   ├── image_compare.py    dHash + rozdíl pixelů, detekce konce
 │   ├── ocr.py              OCR přes engine vestavěný ve Windows
+│   ├── mask.py             vymazání zvolené oblasti ze všech stránek
 │   ├── stitch.py           skládání překrývajících se snímků do stránek
 │   ├── pdf_export.py       bezeztrátové PDF + neviditelná textová vrstva
 │   ├── automation.py       snímací cyklus, stavy, logování
@@ -499,6 +557,7 @@ rdp-screenshot-scraper/
     ├── test_automation.py
     ├── test_config_and_capture.py
     ├── test_image_compare.py
+    ├── test_mask.py
     ├── test_ocr.py
     ├── test_pdf_export.py
     ├── test_pdf_text_layer.py
