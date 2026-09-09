@@ -110,13 +110,12 @@ class TestShiftDetection(StitchTestCase):
         self.assertTrue(any(s % stitch.SCORE_STRIDE for s in found))
 
     def test_document_with_page_gaps(self):
-        """Padne-li překryv do mezery mezi stránkami, použije se obvyklý posun."""
+        """Ověřený spoj musí sedět přesně; u prázdného pruhu se odhaduje."""
         expected, found, plan = self.shifts_of(700, [660, 655, 662], gap_every=12)
-        for want, got in zip(expected, found):
-            self.assertLessEqual(abs(want - got), 10, f"{want} vs {got}")
         for placement, want in zip(plan.placements[1:], expected):
             if placement.verified:
                 self.assertEqual(placement.shift, want, "ověřený spoj musí sedět přesně")
+        self.assertTrue(any(p.verified for p in plan.placements[1:]))
 
     def test_reconstruction_is_bit_exact(self):
         document = tall_document()
@@ -140,20 +139,50 @@ class TestShiftDetection(StitchTestCase):
         expected = [top - tops[i - 1] for i, top in enumerate(tops) if i]
         self.assertEqual(expected, [p.shift for p in plan.placements[1:]])
 
-    def test_blank_overlap_uses_median_shift(self):
-        """V prázdném místě posun určit nelze – vezme se obvyklý posun."""
-        document = tall_document()
-        shots, tops = slice_document(document, 800, [740, 740, 740])
-        blank = Image.new("RGB", (document.size[0], 800), "white")
-        shots.insert(2, blank)  # snímek bez jediného pixelu textu
+    def test_no_overlap_but_text_at_edges_is_butt_joined(self):
+        """Posun přesně o obrazovku nemá překryv – snímky se spojí na doraz."""
+        document = tall_document(lines=200)
+        shots, _tops = slice_document(document, 800, [800, 800, 800])
         logged: list[str] = []
         plan = stitch.plan_ribbon(self.save(shots), log=logged.append)
-        self.assertEqual(len(plan.placements), len(shots))
-        self.assertTrue(any("nelze překryv ověřit" in m for m in logged))
-        estimated = [p for p in plan.placements[1:] if not p.verified]
-        self.assertTrue(estimated)
-        for placement in estimated:
-            self.assertEqual(placement.shift, 740, "má se použít medián posunů")
+        self.assertTrue(any("navazuje bez překryvu" in m for m in logged))
+        for placement in plan.placements[1:]:
+            self.assertEqual(placement.shift, 800)
+            self.assertFalse(placement.page_break, "text u okrajů = pokračování")
+
+    def test_blank_edges_start_a_new_page(self):
+        """Prázdný spodní i horní okraj znamená konec stránky."""
+        width = 600
+        first = Image.new("RGB", (width, 400), "white")
+        ImageDraw.Draw(first).rectangle([20, 20, 580, 220], fill="black")
+        second = Image.new("RGB", (width, 400), "white")
+        ImageDraw.Draw(second).rectangle([20, 180, 580, 380], fill="black")
+        logged: list[str] = []
+        plan = stitch.plan_ribbon(self.save([first, second]), log=logged.append)
+        self.assertTrue(any("začíná novou stránku" in m for m in logged))
+        self.assertTrue(plan.placements[1].page_break)
+
+    def test_page_break_forces_a_cut(self):
+        width = 600
+        first = Image.new("RGB", (width, 400), "white")
+        ImageDraw.Draw(first).rectangle([20, 20, 580, 220], fill="black")
+        second = Image.new("RGB", (width, 400), "white")
+        ImageDraw.Draw(second).rectangle([20, 180, 580, 380], fill="black")
+        plan = stitch.plan_ribbon(self.save([first, second]))
+        cuts = stitch.find_cuts(plan, 5000)
+        self.assertEqual(cuts, [(0, 400), (400, 800)],
+                         "zlom stránky musí rozdělit pás i při velké cílové výšce")
+
+    def test_blank_band_does_not_fake_an_overlap(self):
+        """Bílý pruh proti bílému pruhu nesmí vyrobit přesvědčivou shodu."""
+        width = 600
+        prev = Image.new("RGB", (width, 500), "white")
+        ImageDraw.Draw(prev).rectangle([20, 20, 580, 300], fill="black")
+        curr = Image.new("RGB", (width, 500), "white")
+        ImageDraw.Draw(curr).rectangle([20, 260, 580, 480], fill="black")
+        shift, _err = stitch.find_shift(prev, curr)
+        # jediný společný obsah by byl bílý pruh – ten se musí odmítnout
+        self.assertNotIn(shift, range(440, 500))
 
     def test_different_sizes_are_rejected(self):
         a = Image.new("RGB", (400, 300), "white")

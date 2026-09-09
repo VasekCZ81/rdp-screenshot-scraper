@@ -24,8 +24,21 @@ Jak se hledá posun
    takže profil dobře sedí i při posunu o celý řádek. Pixelová kontrola
    rozliší stejný text od jiného textu na stejné pozici.
 
-Když se posun nepodaří určit, snímek se připojí bez překryvu a událost se
-zapíše do logu – dokument tak zůstane celý, jen bez záruky na spoji.
+Zlom stránky
+------------
+Prohlížeče PDF nescrollují donekonečna: na konci stránky skočí na další
+a sousední snímky pak nemají žádný společný obsah. Takový spoj se nesmí
+odhadovat – rozpozná se podle toho, že ani při obvyklém posunu nesedí pixely,
+a založí se **nová stránka**. Bez toho by se dvě různé stránky slepily
+do jednoho pásu na náhodné pozici.
+
+Prázdný překryv se odmítá: v pruhu bez textu sedí na sebe cokoli. Vyžaduje
+se, aby překryv obsahoval dost řádků textu, a to na **obou** snímcích.
+
+Když překryv chybí úplně, rozhoduje obsah u okrajů. Posunul-li prohlížeč
+přesně o celou obrazovku, text sahá až ke spodnímu okraji prvního snímku
+a hned pokračuje u horního okraje druhého – snímky se pak spojí na doraz.
+Když jsou naopak oba okraje prázdné, skončila stránka a začíná nová.
 """
 
 from __future__ import annotations
@@ -39,11 +52,16 @@ from PIL import Image, ImageChops, ImageStat
 
 SCORE_STRIDE = 4           # každý čtvrtý řádek stačí na seřazení kandidátů
 MIN_OVERLAP_PX = 16        # Page Down často nechá překryv jen pár řádků
-MIN_PROFILE_STD = 2.0      # v překryvu musí být text, ne prázdný okraj
+MIN_TEXT_ROWS = 12         # kolik řádků textu musí překryv obsahovat
+EDGE_BAND_RATIO = 0.04     # jak vysoký okraj snímku se zkoumá u nulového překryvu
+EDGE_TEXT_ROWS = 3         # od kolika řádků textu považujeme okraj za zaplněný
+TEXT_ROW_DELTA = 15        # o kolik musí být řádek tmavší než pozadí
 OUTLIER_MAD_FACTOR = 4.0   # odchylka od obvyklého posuvu, kterou ještě tolerujeme
 MIN_TOLERANCE_PX = 24      # minimální tolerance, když je posuv naprosto pravidelný
 MAX_PROFILE_DIFF = 6.0     # max. průměrný rozdíl profilů (odstíny šedi)
-MAX_VERIFY_DIFF = 0.045    # max. průměrný rozdíl pixelů v překryvu (0.0-1.0)
+# Naměřeno na skutečných snímcích: pravý překryv dává 0.002-0.016,
+# nejlepší možná shoda dvou různých stránek 0.060-0.124.
+MAX_VERIFY_DIFF = 0.030    # max. průměrný rozdíl pixelů v překryvu (0.0-1.0)
 CANDIDATES = 8             # kolik nejlepších posunů ověřit na pixelech
 PROFILE_MARGIN = 0.04      # okraje vynecháme (posuvník, rámeček okna)
 A4_RATIO = 297.0 / 210.0
@@ -66,6 +84,7 @@ class Placement:
     shift: int | None = None      # o kolik se obsah posunul oproti předchozímu
     match_error: float = 0.0
     verified: bool = False
+    page_break: bool = False   # tímto snímkem začíná nová stránka
 
     @property
     def bottom(self) -> int:
@@ -102,60 +121,28 @@ def row_profile(image: Image.Image, margin_ratio: float = PROFILE_MARGIN) -> lis
     return list(values)
 
 
-def _downsample(profile: Sequence[float], factor: int) -> list[float]:
-    return [
-        sum(profile[i : i + factor]) / len(profile[i : i + factor])
-        for i in range(0, len(profile) - factor + 1, factor)
-    ]
+def _text_rows(profile: Sequence[float]) -> list[int]:
+    """Kumulativní počet řádků, které nesou text (jsou tmavší než pozadí)."""
+    if not profile:
+        return [0]
+    ordered = sorted(profile)
+    background = ordered[int(len(ordered) * 0.9)]
+    limit = background - TEXT_ROW_DELTA
+    counts = [0]
+    total = 0
+    for value in profile:
+        if value < limit:
+            total += 1
+        counts.append(total)
+    return counts
 
 
-def _segment_std(profile: Sequence[float], start: int, count: int) -> float:
-    """Rozptyl profilu v úseku – prázdný bílý okraj má nulový."""
-    if count < 2:
-        return 0.0
-    total = 0.0
-    for i in range(count):
-        total += profile[start + i]
-    mean = total / count
-    var = 0.0
-    for i in range(count):
-        delta = profile[start + i] - mean
-        var += delta * delta
-    return (var / count) ** 0.5
-
-
-def _mean_abs_diff(
-    a: Sequence[float], b: Sequence[float], a_from: int, count: int
-) -> float:
-    """Průměrný absolutní rozdíl a[a_from:a_from+count] proti b[:count]."""
-    total = 0.0
-    for i in range(count):
-        diff = a[a_from + i] - b[i]
-        total += diff if diff >= 0.0 else -diff
-    return total / count
-
-
-def _sample_stats(
-    profile: Sequence[float], stride: int
-) -> tuple[list[float], list[float]]:
-    """Kumulativní součty vzorkovaného profilu – umožní počítat rozptyl v O(1)."""
-    sums = [0.0]
-    squares = [0.0]
-    for i in range(0, len(profile), stride):
-        value = profile[i]
-        sums.append(sums[-1] + value)
-        squares.append(squares[-1] + value * value)
-    return sums, squares
-
-
-def _std_from_prefix(
-    sums: Sequence[float], squares: Sequence[float], count: int
-) -> float:
-    if count < 2:
-        return 0.0
-    total = sums[count]
-    var = squares[count] / count - (total / count) ** 2
-    return var ** 0.5 if var > 0.0 else 0.0
+def _has_content(counts: Sequence[int], start: int, count: int) -> bool:
+    """Je v úseku dost textu, aby se podle něj dalo zarovnávat?"""
+    end = min(start + count, len(counts) - 1)
+    if end <= start:
+        return False
+    return counts[end] - counts[start] >= MIN_TEXT_ROWS
 
 
 def _candidate_shifts(
@@ -166,8 +153,10 @@ def _candidate_shifts(
     Nepoužívá se korelační koeficient: `Page Down` nechá překryv často jen
     několik desítek řádků a normalizovaná korelace je na tak malém vzorku
     nestabilní. Přímý rozdíl profilů je absolutní míra, která na délce
-    překryvu nezávisí. Úseky bez textu se zahazují – v prázdném bílém okraji
-    sedí na sebe cokoli.
+    překryvu nezávisí.
+
+    Úsek bez textu se zahazuje, a to na **obou** snímcích – bílý pruh sedí
+    na jakýkoli jiný bílý pruh a vyrobil by přesvědčivou, ale nesmyslnou shodu.
     """
     height = len(prev)
     max_shift = height - min_overlap
@@ -175,14 +164,18 @@ def _candidate_shifts(
         return []
 
     stride = SCORE_STRIDE
-    sums, squares = _sample_stats(curr, stride)
+    prev_text = _text_rows(prev)
+    curr_text = _text_rows(curr)
 
     scored: list[tuple[float, int]] = []
     for shift in range(0, max_shift + 1):
-        count = (height - shift + stride - 1) // stride
+        overlap = height - shift
+        count = (overlap + stride - 1) // stride
         if count < 4:
             continue
-        if _std_from_prefix(sums, squares, count) < MIN_PROFILE_STD:
+        if not _has_content(curr_text, 0, overlap):
+            continue
+        if not _has_content(prev_text, shift, overlap):
             continue
         total = 0.0
         for i in range(count):
@@ -318,6 +311,75 @@ def _recheck_outliers(
         errors[index] = error
 
 
+def _edge_has_text(profile: Sequence[float], from_top: bool) -> bool:
+    """Sahá text až k okraji snímku?"""
+    height = len(profile)
+    band = max(8, int(height * EDGE_BAND_RATIO))
+    counts = _text_rows(profile)
+    start = 0 if from_top else max(0, height - band)
+    return _has_content_at_least(counts, start, band, EDGE_TEXT_ROWS)
+
+
+def _has_content_at_least(
+    counts: Sequence[int], start: int, count: int, minimum: int
+) -> bool:
+    end = min(start + count, len(counts) - 1)
+    if end <= start:
+        return False
+    return counts[end] - counts[start] >= minimum
+
+
+def _resolve_gap(
+    prev_path: str,
+    curr_path: str,
+    prev_profile: Sequence[float],
+    curr_profile: Sequence[float],
+    usual: int,
+    height: int,
+    index: int,
+    log: Callable[[str], None] | None = None,
+) -> tuple[int, bool, bool]:
+    """Rozhodne, co s dvojicí, u které se nenašel překryv.
+
+    Vrací (posun, ověřeno, zlom_stránky). Postup:
+
+    1. Sedí-li pixely při obvyklém posunu, šlo jen o prázdný překryv –
+       použije se obvyklý posun.
+    2. Sahá-li text ke spodnímu okraji prvního snímku nebo k hornímu okraji
+       druhého, prohlížeč posunul přesně o obrazovku a snímky se spojí na doraz.
+    3. Jinak stránka skončila a začíná nová.
+    """
+    if usual < height:
+        with Image.open(prev_path) as prev, Image.open(curr_path) as curr:
+            prev.load()
+            curr.load()
+            difference = _overlap_difference(prev, curr, usual)
+        if difference <= MAX_VERIFY_DIFF:
+            if log:
+                log(
+                    f"Skládání: u snímku {index + 1} nelze překryv ověřit "
+                    f"(prázdné místo), použit obvyklý posun {usual} px"
+                )
+            return usual, False, False
+
+    bottom_filled = _edge_has_text(prev_profile, from_top=False)
+    top_filled = _edge_has_text(curr_profile, from_top=True)
+    if bottom_filled or top_filled:
+        if log:
+            log(
+                f"Skládání: snímek {index + 1} navazuje bez překryvu "
+                "(posun o celou obrazovku), spojeno na doraz"
+            )
+        return height, False, False
+
+    if log:
+        log(
+            f"Skládání: snímek {index + 1} začíná novou stránku "
+            "(prázdný spodní i horní okraj)"
+        )
+    return height, False, True
+
+
 def plan_ribbon(
     image_paths: Sequence[str],
     log: Callable[[str], None] | None = None,
@@ -369,20 +431,31 @@ def plan_ribbon(
 
     placements: list[Placement] = []
     estimated = 0
+    breaks = 0
     top = 0
     for index, path in enumerate(paths):
         step = shifts[index]
         verified = True
+        page_break = False
         if index:
             if step is None:
-                step = fallback
-                verified = False
-                estimated += 1
-                if log:
-                    log(
-                        f"Skládání: u snímku {index + 1} nelze překryv ověřit "
-                        f"(prázdné místo), použit obvyklý posun {fallback} px"
-                    )
+                # Nenašel se překryv. Než ho odhadneme, ověříme, jestli snímky
+                # vůbec navazují – jinak jde o zlom stránky a odhad by slepil
+                # dvě různé stránky na náhodné pozici.
+                step, verified, page_break = _resolve_gap(
+                    paths[index - 1],
+                    paths[index],
+                    profiles[index - 1],
+                    profiles[index],
+                    fallback,
+                    height,
+                    index,
+                    log,
+                )
+                if page_break:
+                    breaks += 1
+                else:
+                    estimated += 1
             top += step
         placements.append(
             Placement(
@@ -393,6 +466,7 @@ def plan_ribbon(
                 shift=step if index else None,
                 match_error=errors[index],
                 verified=verified if index else True,
+                page_break=page_break,
             )
         )
 
@@ -414,6 +488,7 @@ def plan_ribbon(
             f"Skládání: {len(paths)} snímků, posun {known[0]}–{known[-1]} px "
             f"(obvykle {fallback}), pás vysoký {ribbon_height} px"
             + (f", odhadnutých spojů: {estimated}" if estimated else "")
+            + (f", zlomů stránky: {breaks}" if breaks else "")
         )
     return RibbonPlan(
         placements=placements, width=width, height=ribbon_height, profile=ribbon_profile
@@ -424,27 +499,44 @@ def plan_ribbon(
 # Řezání na stránky
 # ---------------------------------------------------------------------------
 def find_cuts(plan: RibbonPlan, page_height: int) -> list[tuple[int, int]]:
-    """Rozdělí pás na stránky, řezy vede co nejsvětlejším místem.
+    """Rozdělí pás na stránky.
 
-    Když prohlížeč mezi stránkami dokumentu nechává mezeru, je tam nejméně
-    inkoustu a řez si ji sám najde. Jinak se řeže mezi řádky textu.
+    Přednost mají **zlomy stránky** – místa, kde snímky prokazatelně
+    nenavazovaly. Jen úsek výrazně delší než cílová výška se ještě dělí,
+    a to co nejsvětlejším místem: má-li prohlížeč mezi stránkami mezeru,
+    řez si ji sám najde.
     """
     page_height = max(32, int(page_height))
-    if plan.height <= page_height:
-        return [(0, plan.height)]
+    boundaries = [0]
+    for placement in plan.placements[1:]:
+        if placement.page_break and placement.top > boundaries[-1]:
+            boundaries.append(placement.top)
+    boundaries.append(plan.height)
 
+    cuts: list[tuple[int, int]] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        if end - start <= page_height * 1.5:
+            cuts.append((start, end))
+        else:
+            cuts.extend(_split_segment(plan, start, end, page_height))
+    return [(a, b) for a, b in cuts if b > a]
+
+
+def _split_segment(
+    plan: RibbonPlan, start: int, end: int, page_height: int
+) -> list[tuple[int, int]]:
+    """Rozdělí příliš dlouhý úsek pásu v nejsvětlejších místech."""
     profile = plan.profile
     search = max(8, int(page_height * CUT_SEARCH_RATIO))
     cuts: list[tuple[int, int]] = []
-    start = 0
-
-    while start < plan.height:
-        if plan.height - start <= page_height * 1.2:
-            cuts.append((start, plan.height))
+    position = start
+    while position < end:
+        if end - position <= page_height * 1.2:
+            cuts.append((position, end))
             break
-        target = start + page_height
-        low = max(start + page_height // 2, target - search)
-        high = min(plan.height - CUT_BAND, target + search)
+        target = position + page_height
+        low = max(position + page_height // 2, target - search)
+        high = min(end - CUT_BAND, target + search)
         best_row, best_ink = target, None
         for row in range(low, high + 1):
             band = profile[row : row + CUT_BAND]
@@ -454,8 +546,8 @@ def find_cuts(plan: RibbonPlan, page_height: int) -> list[tuple[int, int]]:
             if best_ink is None or ink < best_ink:
                 best_ink, best_row = ink, row
         cut = best_row + CUT_BAND // 2
-        cuts.append((start, cut))
-        start = cut
+        cuts.append((position, cut))
+        position = cut
     return cuts
 
 

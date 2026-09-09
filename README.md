@@ -418,7 +418,14 @@ snímá **celou stránku** dokumentu, stránku po stránce.
    bez okrajů okna a bez posuvníku.
 
 > Chcete-li ostřejší obraz než dovolí „Přizpůsobit stránku“, zvětšete zoom na
-> šířku stránky a zapněte **skládání snímků** – viz sekce níže.
+> šířku stránky a zapněte **skládání snímků** – viz sekce níže. Adobe Reader
+> pak jednu stránku ukáže na několik obrazovek a aplikace je poskládá zpět;
+> zlom mezi stránkami dokumentu pozná sama.
+
+> **Pozor na okna překrývající snímanou oblast.** Panel s náhledy stránek
+> ani lišta Total Commanderu do snímané oblasti nepatří – zkreslují obraz
+> i skládání. Buď je vynechte z výběru oblasti, nebo je odstraňte funkcí
+> `Vymazat oblast…`, která se uplatní ještě před skládáním.
 
 ### Vymazání oblasti ze všech stránek
 
@@ -484,11 +491,31 @@ Pak se ale na jednu obrazovku vejde jen část stránky. Od toho je volba
 Výchozí výška stránky odpovídá poměru A4 podle šířky pásu; lze ji přebít
 v nastavení.
 
-### Co když se posun určit nedá
+### Zlom stránky
 
-Padne-li překryv do prázdného místa, není podle čeho zarovnávat. Použije se
-**medián ostatních posunů** – u konstantního posouvání je to výrazně lepší
-odhad než navázání bez překryvu. Událost se zapíše do logu.
+Prohlížeče PDF neposouvají donekonečna. Adobe Reader dojede na konec stránky
+a pak skočí na další – sousední snímky pak nemají žádný společný obsah.
+Takový spoj se **nesmí odhadovat**, jinak se dvě různé stránky slepí do
+jednoho pásu na náhodné pozici.
+
+Když se překryv nenajde, rozhoduje se takto:
+
+1. **Sedí pixely při obvyklém posunu?** Pak šlo jen o prázdný pruh a použije
+   se obvyklý posun.
+2. **Sahá text ke spodnímu okraji prvního snímku nebo k hornímu okraji
+   druhého?** Pak prohlížeč posunul přesně o obrazovku a snímky se spojí
+   na doraz. Nulový překryv je u `Page Down` běžný.
+3. **Jsou oba okraje prázdné?** Stránka skončila – začíná nová stránka
+   a v tom místě se pás vždy rozřízne.
+
+Prahy jsou odvozené z měření na skutečných snímcích: pravý překryv dává
+průměrný rozdíl pixelů 0,002–0,016, zatímco nejlepší možná shoda dvou
+různých stránek 0,060–0,124. Práh je 0,030.
+
+Odmítá se také **prázdný překryv**: v pruhu bez textu sedí na sebe cokoli,
+takže se vyžaduje aspoň 12 řádků textu, a to na obou snímcích. Bez toho se
+64 px bílé plochy „shodlo“ s jinou bílou plochou a vyrobilo přesvědčivý,
+ale nesmyslný posun.
 
 ### Bezpečnost dat
 
