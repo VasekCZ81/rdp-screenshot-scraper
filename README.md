@@ -160,6 +160,9 @@ captures/
         duplicates/
             dup_0001.png          <- potvrzení konce, do PDF se nedostane
             dup_0002.png
+        stitched/                 <- jen když je zapnuté skládání snímků
+            page_0001.png
+            page_0002.png
         scraper.log
         RDP_capture_2026-09-08_184500.pdf
 ```
@@ -260,6 +263,8 @@ vedle `.exe`.
 | Metoda odeslání Page Down | sendinput | `sendinput` / `postmessage` |
 | Provést OCR | zapnuto | vyhledatelná textová vrstva v PDF |
 | Jazyk OCR | cs | jazyková značka, např. `cs` nebo `en-GB` |
+| Skládat snímky | vypnuto | složit překrývající se snímky do celých stránek |
+| Výška složené stránky | 0 | 0 = poměr A4 podle šířky pásu |
 
 ### Automatický odhad DPI stránky PDF
 
@@ -389,6 +394,56 @@ strana B → Page Down → strana B    (potvrzení 2/2 → konec)
 Duplicitní závěrečné snímky se do PDF nedostanou. Ukládají se pouze
 diagnosticky do podadresáře `duplicates/` (lze vypnout v nastavení).
 
+## Skládání snímků – jak dostat vyšší kvalitu
+
+Výška obrazovky je tvrdý strop kvality. Celá A4 se do výšky 2079 px vejde
+nejvýš při **178 DPI**, na Full HD (1080 px) dokonce jen při **~92 DPI**.
+Doostření ani zvětšení už chybějící detail nedoplní – v obraze prostě není.
+
+Jediná cesta k ostřejšímu obrazu vede přes větší zoom ve vzdáleném prohlížeči.
+Pak se ale na jednu obrazovku vejde jen část stránky. Od toho je volba
+**Nastavení → „Skládat překrývající se snímky do celých stránek“**.
+
+### Jak to pracuje
+
+1. Z každého snímku se spočítá **profil řádků** – průměrný jas každého řádku.
+   Dělá se to zmenšením na šířku 1 px filtrem BOX, tedy přesným průměrem
+   v C (~16 ms na snímek), bez jakékoli další knihovny.
+2. Projdou se **všechny** celočíselné posuny a profily se porovnají na každém
+   čtvrtém řádku. Podvzorkování je fázově přesné pro libovolný posun; hrubá
+   mřížka s průměrováním by posun, který není násobkem kroku, rozfázovala.
+3. Nalezený posun se **ověří na skutečných pixelech** v plném rozlišení.
+   Samotný profil nestačí: řádky textu se opakují pravidelně, takže sedí
+   i při posunu o celý řádek.
+4. Posuny, které se vymykají obvyklé hodnotě, se přezkoumají v jejím okolí.
+   `Page Down` posouvá konstantně, takže odlehlá hodnota je podezřelá –
+   a dokumenty mívají na každé stránce stejné záhlaví, na které se dá
+   přesvědčivě, ale chybně napasovat. Když pro odlehlý posun není v okolí
+   obvyklé hodnoty opora, zahodí se a použije se obvyklý posun.
+5. Pás se rozřeže na stránky v **nejsvětlejším místě** poblíž cílové výšky.
+   Má-li prohlížeč mezi stránkami mezeru, řez si ji najde sám; jinak se
+   řeže mezi řádky textu.
+
+Výchozí výška stránky odpovídá poměru A4 podle šířky pásu; lze ji přebít
+v nastavení.
+
+### Co když se posun určit nedá
+
+Padne-li překryv do prázdného místa, není podle čeho zarovnávat. Použije se
+**medián ostatních posunů** – u konstantního posouvání je to výrazně lepší
+odhad než navázání bez překryvu. Událost se zapíše do logu.
+
+### Bezpečnost dat
+
+Pořízená PNG zůstávají nedotčená. Složené stránky vznikají vedle nich
+v podadresáři `stitched/`. Když skládání jakkoli selže, PDF se vytvoří
+z původních snímků přesně jako dosud.
+
+Naměřeno: ~50–90 ms na spoj, tedy u padesátistránkového dokumentu několik
+sekund.
+
+---
+
 ## DPI a více monitorů
 
 Aplikace zapíná **per-monitor DPI awareness v2** (`SetProcessDpiAwarenessContext`)
@@ -434,6 +489,7 @@ rdp-screenshot-scraper/
 │   ├── region_selector.py  fullscreen overlay pro výběr oblasti myší
 │   ├── image_compare.py    dHash + rozdíl pixelů, detekce konce
 │   ├── ocr.py              OCR přes engine vestavěný ve Windows
+│   ├── stitch.py           skládání překrývajících se snímků do stránek
 │   ├── pdf_export.py       bezeztrátové PDF + neviditelná textová vrstva
 │   ├── automation.py       snímací cyklus, stavy, logování
 │   └── config.py           config.json, pracovní adresář, adresáře relací
@@ -447,6 +503,7 @@ rdp-screenshot-scraper/
     ├── test_pdf_export.py
     ├── test_pdf_text_layer.py
     ├── test_region_selector.py
+    ├── test_stitch.py
     └── test_window_manager.py
 ```
 

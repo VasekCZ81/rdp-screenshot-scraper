@@ -17,6 +17,7 @@ CONFIG_FILENAME = "config.json"
 CAPTURES_DIRNAME = "captures"
 LOG_FILENAME = "scraper.log"
 DUPLICATES_DIRNAME = "duplicates"
+STITCHED_DIRNAME = "stitched"
 PAGE_PREFIX = "page_"
 PAGE_DIGITS = 4
 
@@ -97,6 +98,10 @@ class AppConfig:
     pdf_sharpen: float = 0.0
     save_duplicates: bool = True         # ukládat potvrzovací duplicity do duplicates/
 
+    # --- skládání snímků (zoom v prohlížeči > jedna obrazovka na stránku) ---
+    stitch_enabled: bool = False         # složit překrývající se snímky do stránek
+    stitch_page_height_px: int = 0       # 0 = poměr A4 podle šířky pásu
+
     # --- OCR (vestavěný engine Windows) ---
     ocr_enabled: bool = True             # vložit do PDF neviditelnou textovou vrstvu
     ocr_language: str = "cs"             # jazyková značka, např. "cs" nebo "en-GB"
@@ -121,6 +126,8 @@ class AppConfig:
             self.page_down_method = "sendinput"
         # Prázdná adresa je platný stav – znamená „uživatel ještě nezadal“.
         self.rdp_host = str(self.rdp_host).strip()
+        self.stitch_enabled = bool(self.stitch_enabled)
+        self.stitch_page_height_px = max(0, min(60000, int(self.stitch_page_height_px)))
         self.ocr_enabled = bool(self.ocr_enabled)
         self.ocr_language = str(self.ocr_language).strip() or "cs"
         # Nad 4× už jen roste čas a velikost, kvalita ne.

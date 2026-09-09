@@ -21,6 +21,7 @@ from typing import Callable
 
 import config as cfg_mod
 import ocr
+import stitch
 import window_manager as wm
 from capture import CaptureError, Region, ScreenCapturer, validate_region
 from config import AppConfig
@@ -34,6 +35,7 @@ class Status(str, Enum):
     RUNNING = "Probíhá snímání"
     PAUSED = "Pozastaveno"
     END_DETECTED = "Detekován konec dokumentu"
+    STITCHING = "Skládám snímky"
     OCR = "Provádím OCR"
     MAKING_PDF = "Vytvářím PDF"
     DONE = "Dokončeno"
@@ -50,6 +52,46 @@ class RunTargets:
     rdp_hwnd: int
     rdp_label: str
     region: Region
+
+
+def stitch_captures(
+    config: AppConfig,
+    page_files: list[str],
+    session_dir: str,
+    status: Callable[[str], None] | None = None,
+    log: Callable[[str], None] | None = None,
+) -> list[str]:
+    """Složí překrývající se snímky do stránek. Vrací cesty, které mají jít do PDF.
+
+    Pořízené snímky zůstávají nedotčené – složené stránky vznikají vedle nich
+    v podadresáři `stitched/`. Když skládání selže, vrátí se původní snímky,
+    takže se PDF vytvoří tak jako dosud.
+    """
+    if not config.stitch_enabled or len(page_files) < 2:
+        return page_files
+
+    out_dir = os.path.join(session_dir, cfg_mod.STITCHED_DIRNAME)
+    try:
+        if status:
+            status(Status.STITCHING.value)
+        pages = stitch.stitch_pages(
+            page_files,
+            out_dir,
+            page_height=config.stitch_page_height_px,
+            log=log,
+        )
+    except (stitch.StitchError, OSError, ValueError) as exc:
+        if log:
+            log(f"Skládání selhalo, PDF vznikne z původních snímků: {exc}")
+        return page_files
+
+    if not pages:
+        if log:
+            log("Skládání nevrátilo žádnou stránku, používám původní snímky.")
+        return page_files
+    if log:
+        log(f"Skládání: {len(page_files)} snímků složeno do {len(pages)} stránek")
+    return pages
 
 
 def ocr_pages(
@@ -293,7 +335,13 @@ class AutomationController:
             self.log.exception("Neočekávaná chyba")
             self._fail(f"Neočekávaná chyba: {exc}")
         else:
-            self._finish_ok()
+            # Výjimka v else větvi by unikla obsluze výše a vlákno by skončilo
+            # bez události 'finished' – GUI by zůstalo viset na „Vytvářím PDF“.
+            try:
+                self._finish_ok()
+            except Exception as exc:  # noqa: BLE001 – poslední záchranná síť
+                self.log.exception("Chyba při dokončování")
+                self._fail(f"Chyba při dokončování: {exc}")
         finally:
             if capturer is not None:
                 capturer.close()
@@ -462,17 +510,25 @@ class AutomationController:
         name = os.path.basename(self.session_dir.rstrip("\\/"))
         pdf_path = os.path.join(self.session_dir, f"RDP_capture_{name}.pdf")
 
-        layers = ocr_pages(
+        pages = stitch_captures(
             self.config,
             self.page_files,
+            self.session_dir,
+            status=lambda text: self.emit("status", text),
+            log=self._log,
+        )
+
+        layers = ocr_pages(
+            self.config,
+            pages,
             status=lambda text: self.emit("status", text),
             log=self._log,
         )
 
         self._status(Status.MAKING_PDF)
-        self._log(f"Vytvářím PDF z {len(self.page_files)} stránek")
+        self._log(f"Vytvářím PDF z {len(pages)} stránek")
         images_to_pdf(
-            self.page_files,
+            pages,
             pdf_path,
             dpi=self.config.pdf_dpi,
             text_layers=layers,

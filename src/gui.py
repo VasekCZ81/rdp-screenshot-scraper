@@ -19,6 +19,7 @@ from automation import (
     Status,
     close_logger,
     ocr_pages,
+    stitch_captures,
     setup_session_logger,
 )
 from capture import Region
@@ -92,6 +93,7 @@ class SettingsDialog(tk.Toplevel):
         ("pixel_threshold", "Tolerance průměrného rozdílu (0.0-1.0)", float),
         ("changed_threshold", "Tolerance podílu změněných pixelů", float),
         ("pdf_dpi", "DPI stránky PDF", int),
+        ("stitch_page_height_px", "Výška složené stránky [px] (0 = A4)", int),
         ("pdf_page_width_mm", "Šířka předlohy [mm] (0 = použít DPI)", float),
         ("pdf_upscale", "Zvětšení snímku pro PDF (1 = vypnuto)", float),
         ("pdf_sharpen", "Doostření pro PDF [%] (0 = vypnuto)", float),
@@ -157,6 +159,31 @@ class SettingsDialog(tk.Toplevel):
         row += 1
         ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4)
+        )
+
+        row += 1
+        self._stitch_enabled = tk.BooleanVar(value=config.stitch_enabled)
+        ttk.Checkbutton(
+            frame,
+            text="Skládat překrývající se snímky do celých stránek",
+            variable=self._stitch_enabled,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+
+        row += 1
+        ttk.Label(
+            frame,
+            text=(
+                "Zapněte, když v prohlížeči zvětšíte zoom natolik, že se stránka\n"
+                "nevejde na jednu obrazovku. Snímky se podle překryvu poskládají\n"
+                "zpět a rozříznou v nejsvětlejším místě. Pořízená PNG zůstanou."
+            ),
+            foreground="#555555",
+            justify="left",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        row += 1
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(4, 6)
         )
 
         row += 1
@@ -288,6 +315,7 @@ class SettingsDialog(tk.Toplevel):
             setattr(self.config_obj, key, value)
         self.config_obj.page_down_method = self._method.get()
         self.config_obj.save_duplicates = bool(self._save_dups.get())
+        self.config_obj.stitch_enabled = bool(self._stitch_enabled.get())
         self.config_obj.ocr_enabled = bool(self._ocr_enabled.get())
         self.config_obj.ocr_language = self._ocr_language.get()
         self.config_obj.clamp()
@@ -731,15 +759,22 @@ class ScraperApp(tk.Tk):
 
         def worker() -> None:
             try:
-                layers = ocr_pages(
+                sources = stitch_captures(
                     self.config_obj,
                     pages,
+                    session_dir,
+                    status=lambda text: self._emit("status", text),
+                    log=lambda message: self._emit("log", message),
+                )
+                layers = ocr_pages(
+                    self.config_obj,
+                    sources,
                     status=lambda text: self._emit("status", text),
                     log=lambda message: self._emit("log", message),
                 )
                 self._emit("status", Status.MAKING_PDF.value)
                 images_to_pdf(
-                    pages,
+                    sources,
                     pdf_path,
                     dpi=self.config_obj.pdf_dpi,
                     text_layers=layers,
