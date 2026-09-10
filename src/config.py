@@ -103,9 +103,10 @@ class AppConfig:
     pdf_upscale: float = 1.0
     # Doostření (unsharp mask) v procentech; 0 = vypnuto, rozumně 80-150.
     pdf_sharpen: float = 0.0
-    # Bezeztrátové zmenšení PDF indexovanou paletou. Obraz zůstává bit po bitu
-    # stejný, na snímcích vzdálené plochy ušetří zhruba čtvrtinu velikosti.
-    pdf_optimize: bool = True
+    # Komprese obrazu v PDF: "lossless" (indexovaná paleta, obraz beze změny),
+    # "none" (DeviceRGB jako v prvních verzích) nebo "g4" (CCITT G4, 1 bit na
+    # pixel – nejmenší soubor, ale ztrátové).
+    pdf_compression: str = "lossless"
     save_duplicates: bool = True         # ukládat potvrzovací duplicity do duplicates/
 
     # --- snímaná oblast ---
@@ -152,7 +153,10 @@ class AppConfig:
             mask_mod.normalize_rects(self.mask_rects)
         )
         self.region = _clean_region(self.region)
-        self.pdf_optimize = bool(self.pdf_optimize)
+        import pdf_export as pdf_mod
+
+        if self.pdf_compression not in pdf_mod.COMPRESSIONS:
+            self.pdf_compression = pdf_mod.COMPRESSION_LOSSLESS
         self.ocr_enabled = bool(self.ocr_enabled)
         self.ocr_language = str(self.ocr_language).strip() or "cs"
         # Nad 4× už jen roste čas a velikost, kvalita ne.
@@ -178,6 +182,9 @@ class AppConfig:
         for key, value in (data or {}).items():
             if key in known:
                 setattr(cfg, key, value)
+        # Migrace ze starší volby pdf_optimize (bool).
+        if "pdf_compression" not in (data or {}) and data.get("pdf_optimize") is False:
+            cfg.pdf_compression = "none"
         try:
             cfg.clamp()
         except (TypeError, ValueError):

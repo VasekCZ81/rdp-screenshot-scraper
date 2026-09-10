@@ -29,6 +29,7 @@ nezávisle na prohlížeči.
 
 from __future__ import annotations
 
+import io
 import os
 import time
 import zlib
@@ -214,9 +215,27 @@ def prepare_image(
 # Indexovaná paleta se vejde nanejvýš na 256 barev.
 MAX_PALETTE = 256
 
+# Režimy komprese obrazu ve výsledném PDF.
+COMPRESSION_NONE = "none"          # DeviceRGB, flate-6 – jako v prvních verzích
+COMPRESSION_LOSSLESS = "lossless"  # indexovaná paleta, obraz beze změny
+COMPRESSION_BILEVEL = "g4"         # CCITT G4, 1 bit na pixel – ZTRÁTOVÉ
+COMPRESSIONS = (COMPRESSION_NONE, COMPRESSION_LOSSLESS, COMPRESSION_BILEVEL)
 
-def encode_page_image(image: Image.Image, optimize: bool = True) -> tuple[bytes, str, str]:
-    """Zakóduje stránku do streamu XObjectu. Vrací (data, colorspace, popis).
+# Práh převodu na černobílou. Vyšší hodnota nechá písmu víc tahu: pixely
+# vyhlazení pod prahem zčernají. Naměřeno na skutečných snímcích – 128 písmo
+# ztenčuje, 176 drží tah blízko předloze a na velikost nemá vliv.
+BILEVEL_THRESHOLD = 176
+
+# Značky TIFF, ze kterých se vytahuje hotový G4 stream.
+TIFF_STRIPOFFSETS = 273
+TIFF_ROWSPERSTRIP = 278
+TIFF_STRIPBYTECOUNTS = 279
+
+
+def encode_page_image(
+    image: Image.Image, compression: str = COMPRESSION_LOSSLESS
+) -> tuple[bytes, str, str]:
+    """Zakóduje stránku do streamu XObjectu. Vrací (data, klíče slovníku, popis).
 
     Snímky vzdálené plochy mívají jen několik desítek barev – text je černý,
     papír bílý a mezi tím pár odstínů vyhlazení. Tři bajty na pixel jsou pak
@@ -231,20 +250,91 @@ def encode_page_image(image: Image.Image, optimize: bool = True) -> tuple[bytes,
     | DeviceRGB, flate-9  | 7,31 MB       |  95 % |
     | indexovaná paleta   | 5,52 MB       |  72 % |
 
+    | CCITT G4, 1 bit    | 1,26 MB       |  16 % |
+
     PNG prediktor se záměrně nepoužívá: na velkých jednolitých plochách je
     **horší** než prostý flate (naměřeno 128 %). Diference rozseká dlouhé
     shodné běhy a na hranách písmen vyrobí vysokou entropii.
+
+    `COMPRESSION_BILEVEL` je jediný **ztrátový** režim: stránka se převede na
+    čistě černobílou, takže zmizí vyhlazení písma a šedé výplně ve výkresech.
+    Pro čistě textové dokumenty je to nejmenší možný výstup, jinde se nehodí.
     """
-    if not optimize:
-        return zlib.compress(image.tobytes(), 6), "/DeviceRGB", "DeviceRGB"
+    if compression == COMPRESSION_BILEVEL:
+        bilevel = _bilevel_stream(image)
+        if bilevel is not None:
+            data, entries = bilevel
+            return data, entries, "CCITT G4"
+        # Kodek není k dispozici – radši bezeztrátově než spadnout.
+        compression = COMPRESSION_LOSSLESS
+
+    if compression == COMPRESSION_NONE:
+        return (
+            zlib.compress(image.tobytes(), 6),
+            "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode",
+            "DeviceRGB",
+        )
 
     indexed = _indexed_image(image)
     if indexed is None:
-        return zlib.compress(image.tobytes(), 9), "/DeviceRGB", "DeviceRGB"
+        return (
+            zlib.compress(image.tobytes(), 9),
+            "/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode",
+            "DeviceRGB",
+        )
 
     data, table, hival = indexed
-    colorspace = f"[/Indexed /DeviceRGB {hival} <{table.hex().upper()}>]"
-    return zlib.compress(data, 9), colorspace, f"paleta {hival + 1} barev"
+    entries = (
+        f"/ColorSpace [/Indexed /DeviceRGB {hival} <{table.hex().upper()}>] "
+        "/BitsPerComponent 8 /Filter /FlateDecode"
+    )
+    return zlib.compress(data, 9), entries, f"paleta {hival + 1} barev"
+
+
+def _bilevel_stream(image: Image.Image) -> tuple[bytes, str] | None:
+    """CCITT G4 přes zapisovač TIFF v Pillow. `None`, když kodek chybí.
+
+    Dvě věci, na kterých se to obvykle rozbije:
+
+    * **Dithering.** `convert("1")` rozptýlí odstíny vyhlazení do šumu, který
+      se nedá komprimovat a text vypadá zrnitě. Prahuje se proto natvrdo.
+    * **Počet stripů.** TIFF si data dělí po ~8 kB a každý strip kóduje zvlášť,
+      takže je nelze prostě slepit. `RowsPerStrip` = výška vynutí jediný strip,
+      který jde do PDF beze změny.
+
+    Polarita se **musí** převrátit přes `/BlackIs1 true`. Pillow zapisuje TIFF
+    s `photometric=1` (BlackIsZero), ale `CCITTFaxDecode` ve výchozím stavu
+    (`/BlackIs1 false`) čeká faxovou konvenci opačnou. Bez toho vyjde bílý text
+    na černé stránce – ověřeno vykreslením hotového PDF v prohlížeči.
+    """
+    width, height = image.size
+    mono = image.convert("L").point(
+        lambda value: 255 if value >= BILEVEL_THRESHOLD else 0, mode="1"
+    )
+    buffer = io.BytesIO()
+    try:
+        mono.save(
+            buffer,
+            format="TIFF",
+            compression="group4",
+            tiffinfo={TIFF_ROWSPERSTRIP: height},
+        )
+    except (OSError, ValueError, KeyError):
+        return None
+
+    with Image.open(io.BytesIO(buffer.getvalue())) as tiff:
+        offsets = tiff.tag_v2.get(TIFF_STRIPOFFSETS) or ()
+        counts = tiff.tag_v2.get(TIFF_STRIPBYTECOUNTS) or ()
+    if len(offsets) != 1 or len(counts) != 1:
+        return None  # víc stripů slepit nelze
+
+    raw = buffer.getvalue()
+    data = raw[offsets[0] : offsets[0] + counts[0]]
+    entries = (
+        "/ColorSpace /DeviceGray /BitsPerComponent 1 /Filter /CCITTFaxDecode "
+        f"/DecodeParms << /K -1 /Columns {width} /Rows {height} /BlackIs1 true >>"
+    )
+    return data, entries
 
 
 def _indexed_image(image: Image.Image) -> tuple[bytes, bytes, int] | None:
@@ -285,7 +375,7 @@ def images_to_pdf(
     page_width_mm: float | None = None,
     upscale: float = 1.0,
     sharpen: float = 0.0,
-    optimize: bool = True,
+    compression: str = COMPRESSION_LOSSLESS,
 ) -> str:
     """Vytvoří PDF z uvedených obrázků. Vrací cestu k PDF.
 
@@ -303,9 +393,13 @@ def images_to_pdf(
     `sharpen` je síla doostření v procentech (unsharp mask, 0 = vypnuto).
     Rozumné hodnoty jsou 80–150; vyšší dělá kolem písmen světlé lemy.
 
-    `optimize` zapíná bezeztrátové zmenšení souboru přes indexovanou paletu –
-    viz `encode_page_image()`. Obraz zůstává bit po bitu stejný.
+    `compression` volí kódování obrazu – viz `encode_page_image()`:
+    `COMPRESSION_LOSSLESS` (indexovaná paleta, obraz beze změny),
+    `COMPRESSION_NONE` (DeviceRGB jako v prvních verzích) nebo
+    `COMPRESSION_BILEVEL` (CCITT G4, nejmenší soubor, ale ztrátové).
     """
+    if compression not in COMPRESSIONS:
+        compression = COMPRESSION_LOSSLESS
     paths = [p for p in image_paths if p]
     if not paths:
         raise PdfExportError("Nejsou k dispozici žádné snímky pro vytvoření PDF.")
@@ -385,6 +479,7 @@ def images_to_pdf(
 
             words_total = 0
             palette_pages = 0
+            bilevel_pages = 0
             image_bytes = 0
             for index, path in enumerate(paths):
                 with Image.open(path) as img:
@@ -424,11 +519,13 @@ def images_to_pdf(
                     if amount > 0:
                         log(f"PDF: doostření {amount:g} %")
 
-                compressed, colorspace, how = encode_page_image(sample, optimize)
+                compressed, entries, how = encode_page_image(sample, compression)
                 sample.close()
                 del sample
                 if how.startswith("paleta"):
                     palette_pages += 1
+                elif how == "CCITT G4":
+                    bilevel_pages += 1
                 image_bytes += len(compressed)
 
                 image_id = alloc()
@@ -437,8 +534,7 @@ def images_to_pdf(
                     (
                         "<< /Type /XObject /Subtype /Image "
                         f"/Width {sample_w} /Height {sample_h} "
-                        f"/ColorSpace {colorspace} /BitsPerComponent 8 "
-                        f"/Filter /FlateDecode /Length {len(compressed)} >>"
+                        f"{entries} /Length {len(compressed)} >>"
                     ).encode("ascii"),
                     compressed,
                 )
@@ -498,7 +594,9 @@ def images_to_pdf(
                 log(f"PDF: vložena textová vrstva OCR, slov celkem {words_total}")
             if log:
                 summary = f"PDF: obrazová data {image_bytes / 1024 / 1024:.2f} MB"
-                if optimize:
+                if bilevel_pages:
+                    summary += f", CCITT G4 na {bilevel_pages} z {count} stránek"
+                elif compression == COMPRESSION_LOSSLESS:
                     summary += (
                         f", bezeztrátová paleta na {palette_pages} z {count} stránek"
                     )

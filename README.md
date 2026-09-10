@@ -312,7 +312,7 @@ vedle `.exe`.
 | Šířka předlohy [mm] | 0 | 0 = vypnuto; kladná hodnota DPI dopočítá – viz níže |
 | Zvětšení snímku pro PDF | 1 | 1–4×; víc vzorků na stránku, detail nepřidá |
 | Doostření pro PDF [%] | 0 | 0–300; unsharp mask, rozumně 80–150 |
-| Bezeztrátově zmenšit PDF | zapnuto | indexovaná paleta – viz níže |
+| Komprese obrazu v PDF | bezeztrátová paleta | `lossless` / `none` / `g4` – viz níže |
 | Zvětšení snímku pro OCR | 2 | 1–4×; drobné písmo engine rozpozná spolehlivěji |
 | Adresa RDP relace | *(prázdné)* | **povinné** – podle ní se hledá okno `mstsc.exe` |
 | Šířka zakládané RDP relace | 2560 | rozlišení relace, kterou založí tlačítko |
@@ -375,37 +375,60 @@ text bývá při zobrazení hladší. Soubor roste zhruba s druhou mocninou fakt
 takže 2× znamená několikanásobně větší PDF. Vyplatí se to zkusit teprve tehdy,
 když nejde zvýšit rozlišení samotné RDP relace.
 
-### Bezeztrátové zmenšení PDF
+### Komprese obrazu v PDF
 
 Snímky vzdálené plochy mívají jen několik desítek barev – text je černý, papír
-bílý a mezi tím pár odstínů vyhlazení. Tři bajty na pixel jsou pak zbytečné:
-stránky s nejvýš 256 barvami se ukládají s **indexovanou paletou**
-(`/Indexed /DeviceRGB`), tedy jeden bajt na pixel plus tabulka barev.
-Obraz zůstává **bit po bitu stejný**, barevnější stránky se uloží jako dosud.
+bílý a mezi tím pár odstínů vyhlazení. Tři bajty na pixel jsou pak zbytečné.
+V Nastavení jsou proto tři režimy; naměřeno na skutečném devatenáctistránkovém
+dokumentu 2406×3387 px:
 
-Naměřeno na skutečném devatenáctistránkovém dokumentu 2406×3387 px:
+| režim | výsledné PDF | podíl | čas | kvalita |
+|---|---|---|---|---|
+| Žádná – plné barvy (`none`) | 7,69 MB | 100 % | 8 s | – |
+| **Bezeztrátová paleta** (`lossless`, výchozí) | **5,53 MB** | **72 %** | 29 s | **bit po bitu shodné** |
+| Černobílá CCITT G4 (`g4`) | 1,00 MB | 13 % | 3 s | ztrátové |
 
-| varianta | obrazová data | podíl | kvalita |
-|---|---|---|---|
-| DeviceRGB, flate-6 | 7,68 MB | 100 % | – |
-| DeviceRGB, flate-9 | 7,31 MB | 95 % | bit po bitu shodné |
-| **indexovaná paleta** | **5,52 MB** | **72 %** | **bit po bitu shodné** |
-| PNG prediktor | 9,85 MB | 128 % | shodné, ale větší |
-| JPEG q90 | 16,79 MB | 219 % | ztrátové a větší |
-| CCITT G4 (1 bit) | 4,20 MB | 55 % | ztrátové, ruší vyhlazení písma |
+#### Bezeztrátová paleta
 
-Celé PDF vyšlo ze 7,69 MB na **5,53 MB**, tedy o 28 % méně. Paleta se uplatnila
-na 15 z 19 stránek; zbylé mají barev víc a šly cestou `DeviceRGB`.
+Stránky s nejvýš 256 barvami se uloží s indexovanou paletou
+(`/Indexed /DeviceRGB`) – jeden bajt na pixel plus tabulka barev. Obraz zůstává
+**bit po bitu stejný**, barevnější stránky se uloží jako `DeviceRGB`.
+V měřeném dokumentu se paleta uplatnila na 15 z 19 stránek.
 
 Kóduje se opatrně: kvantizace se použije jedině tehdy, když zpětný převod dá
 **přesně tytéž pixely**. Jinak stránka spadne na `DeviceRGB` – kvalita má
-přednost před velikostí. Cena je zhruba **1 s na stránku** navíc při tvorbě
-PDF; vypnout to jde v Nastavení.
+přednost před velikostí. Cena je zhruba 1 s na stránku navíc.
 
-> **PNG prediktor se záměrně nepoužívá.** Je to obvyklý trik, ale tady škodí:
-> naměřeno ručně mimo Pillow `None` 493 k, `Sub` 614 k, `Up` 746 k proti 482 k
-> bez prediktoru. Velké jednolité plochy se komprimují líp jako dlouhé shodné
-> běhy; diference je rozseká a na hranách písmen vyrobí vysokou entropii.
+#### Černobílá CCITT G4
+
+Stránka se prahuje na čistě černobílou a kóduje faxovým G4. Soubor klesne na
+osminu a je to i **nejrychlejší** režim, protože odpadne velký průchod zlibem.
+Je to ale **jediný ztrátový režim**: zmizí vyhlazení písma i šedé výplně, takže
+se hodí na čistě textové dokumenty, ne na výkresy s odstíny.
+
+Dvě věci, na kterých se G4 obvykle rozbije a které jsou v kódu ošetřené:
+
+* **Dithering.** `convert("1")` rozptýlí odstíny vyhlazení do šumu – text
+  vypadá zrnitě a šum se navíc nedá komprimovat. Prahuje se proto natvrdo
+  (`BILEVEL_THRESHOLD = 176`; nižší práh písmo ztenčuje).
+* **Počet stripů.** TIFF si data dělí po ~8 kB a každý strip kóduje zvlášť,
+  takže je nelze slepit. `RowsPerStrip` = výška vynutí jediný strip.
+* **Polarita.** Bez `/BlackIs1 true` vyjde bílý text na černé stránce. Pillow
+  zapisuje `photometric=1` (BlackIsZero), ale `CCITTFaxDecode` čeká ve výchozím
+  stavu opačnou faxovou konvenci. Ověřeno vykreslením hotového PDF.
+
+#### Co se neosvědčilo
+
+| varianta | obrazová data | proč ne |
+|---|---|---|
+| PNG prediktor | 128 % | na jednolitých plochách horší než prostý flate |
+| JPEG q90 | 219 % | ztrátové **a zároveň větší** |
+| kvantizace na 16 barev | 96 % palety | proti bezeztrátové paletě ušetří jen 5 % |
+
+Prediktor jsem ověřoval i ručně mimo Pillow: `None` 493 k, `Sub` 614 k,
+`Up` 746 k proti 482 k bez prediktoru. Velké jednolité plochy se komprimují líp
+jako dlouhé shodné běhy; diference je rozseká a na hranách písmen vyrobí
+vysokou entropii.
 
 ### Doostření (unsharp mask)
 

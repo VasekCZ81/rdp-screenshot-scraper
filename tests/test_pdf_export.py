@@ -14,6 +14,10 @@ from PIL import Image  # noqa: E402
 from helpers import make_page, read_bytes as _read  # noqa: E402
 
 from pdf_export import (  # noqa: E402
+    COMPRESSION_BILEVEL,
+    COMPRESSION_LOSSLESS,
+    COMPRESSION_NONE,
+    BILEVEL_THRESHOLD,
     MAX_DPI,
     MAX_PALETTE,
     PdfExportError,
@@ -104,7 +108,7 @@ class TestPdfExport(unittest.TestCase):
 
         paths = self._pages(1, size=(64, 48))
         pdf = os.path.join(self.dir, "result.pdf")
-        images_to_pdf(paths, pdf, optimize=False)
+        images_to_pdf(paths, pdf, compression=COMPRESSION_NONE)
         data = _read(pdf)
 
         match = re.search(rb"/Filter /FlateDecode /Length (\d+) >>\nstream\n", data)
@@ -308,7 +312,7 @@ class TestLosslessOptimisation(unittest.TestCase):
 
     def test_palette_roundtrip_is_bit_exact(self):
         image = make_page(3, (200, 150))
-        data, colorspace, how = encode_page_image(image, optimize=True)
+        data, colorspace, how = encode_page_image(image, COMPRESSION_LOSSLESS)
         self.assertTrue(how.startswith("paleta"), how)
         self.assertIn("/Indexed /DeviceRGB", colorspace)
         rebuilt = self._rebuild(data, colorspace, image.size)
@@ -316,8 +320,8 @@ class TestLosslessOptimisation(unittest.TestCase):
 
     def test_palette_is_smaller_than_devicergb(self):
         image = make_page(5, (400, 300))
-        small, _cs, _how = encode_page_image(image, optimize=True)
-        plain, _cs2, _how2 = encode_page_image(image, optimize=False)
+        small, _cs, _how = encode_page_image(image, COMPRESSION_LOSSLESS)
+        plain, _cs2, _how2 = encode_page_image(image, COMPRESSION_NONE)
         self.assertLess(len(small), len(plain))
 
     def test_colourful_page_falls_back_to_devicergb(self):
@@ -329,14 +333,16 @@ class TestLosslessOptimisation(unittest.TestCase):
                 index = y * 64 + x
                 pixels[x, y] = (index % 256, (index // 256) % 256, (index * 7) % 256)
         self.assertIsNone(image.getcolors(maxcolors=MAX_PALETTE))
-        _data, colorspace, how = encode_page_image(image, optimize=True)
-        self.assertEqual(colorspace, "/DeviceRGB")
+        _data, entries, how = encode_page_image(image, COMPRESSION_LOSSLESS)
+        self.assertIn("/ColorSpace /DeviceRGB", entries)
+        self.assertIn("/BitsPerComponent 8", entries)
         self.assertEqual(how, "DeviceRGB")
 
-    def test_disabled_keeps_the_original_encoding(self):
+    def test_none_keeps_the_original_encoding(self):
         image = make_page(1, (120, 90))
-        data, colorspace, how = encode_page_image(image, optimize=False)
-        self.assertEqual(colorspace, "/DeviceRGB")
+        data, entries, how = encode_page_image(image, COMPRESSION_NONE)
+        self.assertIn("/ColorSpace /DeviceRGB", entries)
+        self.assertIn("/Filter /FlateDecode", entries)
         self.assertEqual(how, "DeviceRGB")
         self.assertEqual(zlib.decompress(data), image.tobytes())
 
@@ -346,7 +352,7 @@ class TestLosslessOptimisation(unittest.TestCase):
         path = os.path.join(self.dir, "page_0001.png")
         source.save(path, "PNG")
         pdf = os.path.join(self.dir, "result.pdf")
-        images_to_pdf([path], pdf, optimize=True)
+        images_to_pdf([path], pdf, compression=COMPRESSION_LOSSLESS)
         data = _read(pdf)
 
         self.assertIn(b"/Indexed /DeviceRGB", data)
@@ -373,9 +379,103 @@ class TestLosslessOptimisation(unittest.TestCase):
             paths.append(path)
         plain = os.path.join(self.dir, "plain.pdf")
         small = os.path.join(self.dir, "small.pdf")
-        images_to_pdf(paths, plain, optimize=False)
-        images_to_pdf(paths, small, optimize=True)
+        images_to_pdf(paths, plain, compression=COMPRESSION_NONE)
+        images_to_pdf(paths, small, compression=COMPRESSION_LOSSLESS)
         self.assertLess(os.path.getsize(small), os.path.getsize(plain))
+
+
+class TestBilevelG4(unittest.TestCase):
+    """CCITT G4 – jediný ztrátový režim, o to víc musí sedět detaily."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_dictionary_entries_match_the_ccitt_filter(self):
+        image = make_page(1, (320, 240))
+        data, entries, how = encode_page_image(image, COMPRESSION_BILEVEL)
+        self.assertEqual(how, "CCITT G4")
+        self.assertTrue(data)
+        self.assertIn("/ColorSpace /DeviceGray", entries)
+        self.assertIn("/BitsPerComponent 1", entries)
+        self.assertIn("/Filter /CCITTFaxDecode", entries)
+        self.assertIn("/K -1", entries)          # čistá dvourozměrná G4
+        self.assertIn("/Columns 320", entries)
+        self.assertIn("/Rows 240", entries)
+
+    def test_black_is_1_must_stay_set(self):
+        """Bez /BlackIs1 true vyjde bílý text na černé stránce.
+
+        Pillow zapisuje TIFF s photometric=1 (BlackIsZero), CCITTFaxDecode ale
+        ve výchozím stavu čeká opačnou faxovou konvenci. Ověřeno vykreslením
+        hotového PDF v prohlížeči – bez tohoto klíče je stránka negativ.
+        """
+        _data, entries, _how = encode_page_image(make_page(2), COMPRESSION_BILEVEL)
+        self.assertIn("/BlackIs1 true", entries)
+
+    def test_stream_is_a_single_g4_strip(self):
+        """Víc TIFF stripů nelze slepit – každý se kóduje zvlášť."""
+        import io
+
+        image = make_page(3, (400, 500))
+        data, _entries, _how = encode_page_image(image, COMPRESSION_BILEVEL)
+
+        mono = image.convert("L").point(
+            lambda value: 255 if value >= BILEVEL_THRESHOLD else 0, mode="1"
+        )
+        buffer = io.BytesIO()
+        mono.save(buffer, format="TIFF", compression="group4", tiffinfo={278: 500})
+        with Image.open(io.BytesIO(buffer.getvalue())) as tiff:
+            offsets, counts = tiff.tag_v2[273], tiff.tag_v2[279]
+        self.assertEqual(len(offsets), 1, "vynucený rowsperstrip nedal jediný strip")
+        expected = buffer.getvalue()[offsets[0] : offsets[0] + counts[0]]
+        self.assertEqual(data, expected)
+
+    def test_threshold_does_not_dither(self):
+        """Rozptyl odstínů by udělal ze šedé plochy šum, který se nekomprimuje."""
+        light = Image.new("RGB", (64, 64), (200, 200, 200))
+        dark = Image.new("RGB", (64, 64), (100, 100, 100))
+        for image, expected in ((light, 255), (dark, 0)):
+            mono = image.convert("L").point(
+                lambda value: 255 if value >= BILEVEL_THRESHOLD else 0, mode="1"
+            )
+            self.assertEqual(
+                mono.convert("L").getextrema(),
+                (expected, expected),
+                "jednolitá šeď se musí převést na jednolitou plochu",
+            )
+
+    def test_pdf_uses_ccitt_and_is_the_smallest(self):
+        paths = []
+        for index in range(3):
+            path = os.path.join(self.dir, f"page_{index + 1:04d}.png")
+            make_page(index, (600, 800)).save(path, "PNG")
+            paths.append(path)
+
+        outputs = {}
+        for mode in (COMPRESSION_NONE, COMPRESSION_LOSSLESS, COMPRESSION_BILEVEL):
+            pdf = os.path.join(self.dir, f"{mode}.pdf")
+            images_to_pdf(paths, pdf, compression=mode)
+            outputs[mode] = pdf
+
+        data = _read(outputs[COMPRESSION_BILEVEL])
+        self.assertIn(b"/Filter /CCITTFaxDecode", data)
+        self.assertNotIn(b"/Indexed", data)
+        self.assertNotIn(b"DCTDecode", data)
+
+        sizes = {mode: os.path.getsize(path) for mode, path in outputs.items()}
+        self.assertLess(sizes[COMPRESSION_BILEVEL], sizes[COMPRESSION_LOSSLESS])
+        self.assertLess(sizes[COMPRESSION_LOSSLESS], sizes[COMPRESSION_NONE])
+
+    def test_unknown_mode_falls_back_to_lossless(self):
+        paths = [os.path.join(self.dir, "page_0001.png")]
+        make_page(0, (120, 90)).save(paths[0], "PNG")
+        pdf = os.path.join(self.dir, "result.pdf")
+        images_to_pdf(paths, pdf, compression="nesmysl")
+        self.assertIn(b"/Indexed", _read(pdf))
 
 
 if __name__ == "__main__":

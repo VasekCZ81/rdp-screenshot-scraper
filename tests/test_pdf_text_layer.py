@@ -42,7 +42,7 @@ class TextLayerTestCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def make_pdf(self, layers, count=None, size=(900, 700), optimize=True) -> str:
+    def make_pdf(self, layers, count=None, size=(900, 700), compression="lossless") -> str:
         count = count if count is not None else len(layers)
         paths = []
         for index in range(count):
@@ -50,7 +50,7 @@ class TextLayerTestCase(unittest.TestCase):
             make_text_page(index * 40 + 1, size).save(path, "PNG")
             paths.append(path)
         pdf = os.path.join(self.dir, "result.pdf")
-        images_to_pdf(paths, pdf, dpi=96, text_layers=layers, optimize=optimize)
+        images_to_pdf(paths, pdf, dpi=96, text_layers=layers, compression=compression)
         return pdf
 
 
@@ -196,8 +196,8 @@ class TestPlainPdfUnaffected(TextLayerTestCase):
         from PIL import Image
 
         layer = page_text(CZECH)
-        # Bez optimalizace: stream je přímo RGB, takže jde porovnat s předlohou.
-        pdf = self.make_pdf([layer], size=(64, 48), optimize=False)
+        # Bez komprese: stream je přímo RGB, takže jde porovnat s předlohou.
+        pdf = self.make_pdf([layer], size=(64, 48), compression="none")
         doc = PdfDocument.from_file(pdf)
         image_id, _body = doc.find_object(b"/Subtype /Image")
         # PdfDocument streamy s /FlateDecode rozbaluje sám
