@@ -312,6 +312,7 @@ vedle `.exe`.
 | Šířka předlohy [mm] | 0 | 0 = vypnuto; kladná hodnota DPI dopočítá – viz níže |
 | Zvětšení snímku pro PDF | 1 | 1–4×; víc vzorků na stránku, detail nepřidá |
 | Doostření pro PDF [%] | 0 | 0–300; unsharp mask, rozumně 80–150 |
+| Bezeztrátově zmenšit PDF | zapnuto | indexovaná paleta – viz níže |
 | Zvětšení snímku pro OCR | 2 | 1–4×; drobné písmo engine rozpozná spolehlivěji |
 | Adresa RDP relace | *(prázdné)* | **povinné** – podle ní se hledá okno `mstsc.exe` |
 | Šířka zakládané RDP relace | 2560 | rozlišení relace, kterou založí tlačítko |
@@ -373,6 +374,38 @@ zůstává původní snímek – ale prohlížeč pak nezmenšuje tak hrubou př
 text bývá při zobrazení hladší. Soubor roste zhruba s druhou mocninou faktoru,
 takže 2× znamená několikanásobně větší PDF. Vyplatí se to zkusit teprve tehdy,
 když nejde zvýšit rozlišení samotné RDP relace.
+
+### Bezeztrátové zmenšení PDF
+
+Snímky vzdálené plochy mívají jen několik desítek barev – text je černý, papír
+bílý a mezi tím pár odstínů vyhlazení. Tři bajty na pixel jsou pak zbytečné:
+stránky s nejvýš 256 barvami se ukládají s **indexovanou paletou**
+(`/Indexed /DeviceRGB`), tedy jeden bajt na pixel plus tabulka barev.
+Obraz zůstává **bit po bitu stejný**, barevnější stránky se uloží jako dosud.
+
+Naměřeno na skutečném devatenáctistránkovém dokumentu 2406×3387 px:
+
+| varianta | obrazová data | podíl | kvalita |
+|---|---|---|---|
+| DeviceRGB, flate-6 | 7,68 MB | 100 % | – |
+| DeviceRGB, flate-9 | 7,31 MB | 95 % | bit po bitu shodné |
+| **indexovaná paleta** | **5,52 MB** | **72 %** | **bit po bitu shodné** |
+| PNG prediktor | 9,85 MB | 128 % | shodné, ale větší |
+| JPEG q90 | 16,79 MB | 219 % | ztrátové a větší |
+| CCITT G4 (1 bit) | 4,20 MB | 55 % | ztrátové, ruší vyhlazení písma |
+
+Celé PDF vyšlo ze 7,69 MB na **5,53 MB**, tedy o 28 % méně. Paleta se uplatnila
+na 15 z 19 stránek; zbylé mají barev víc a šly cestou `DeviceRGB`.
+
+Kóduje se opatrně: kvantizace se použije jedině tehdy, když zpětný převod dá
+**přesně tytéž pixely**. Jinak stránka spadne na `DeviceRGB` – kvalita má
+přednost před velikostí. Cena je zhruba **1 s na stránku** navíc při tvorbě
+PDF; vypnout to jde v Nastavení.
+
+> **PNG prediktor se záměrně nepoužívá.** Je to obvyklý trik, ale tady škodí:
+> naměřeno ručně mimo Pillow `None` 493 k, `Sub` 614 k, `Up` 746 k proti 482 k
+> bez prediktoru. Velké jednolité plochy se komprimují líp jako dlouhé shodné
+> běhy; diference je rozseká a na hranách písmen vyrobí vysokou entropii.
 
 ### Doostření (unsharp mask)
 

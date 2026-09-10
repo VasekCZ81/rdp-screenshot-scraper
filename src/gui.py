@@ -358,6 +358,31 @@ class SettingsDialog(tk.Toplevel):
         )
 
         row += 1
+        self._pdf_optimize = tk.BooleanVar(value=config.pdf_optimize)
+        ttk.Checkbutton(
+            frame,
+            text="Bezeztrátově zmenšit výsledné PDF",
+            variable=self._pdf_optimize,
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
+
+        row += 1
+        ttk.Label(
+            frame,
+            text=(
+                "Stránky s nejvýš 256 barvami se uloží s indexovanou paletou.\n"
+                "Obraz zůstává bit po bitu stejný, soubor je zhruba o čtvrtinu\n"
+                "menší. Barevnější stránky se uloží jako dosud."
+            ),
+            foreground="#555555",
+            justify="left",
+        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        row += 1
+        ttk.Separator(frame, orient="horizontal").grid(
+            row=row, column=0, columnspan=2, sticky="ew", pady=(4, 6)
+        )
+
+        row += 1
         self._ocr_enabled = tk.BooleanVar(value=config.ocr_enabled)
         ttk.Checkbutton(
             frame,
@@ -486,6 +511,7 @@ class SettingsDialog(tk.Toplevel):
             setattr(self.config_obj, key, value)
         self.config_obj.page_down_method = self._method.get()
         self.config_obj.save_duplicates = bool(self._save_dups.get())
+        self.config_obj.pdf_optimize = bool(self._pdf_optimize.get())
         self.config_obj.ocr_enabled = bool(self._ocr_enabled.get())
         self.config_obj.ocr_language = self._ocr_language.get()
         self.config_obj.clamp()
@@ -1288,6 +1314,7 @@ class ScraperApp(tk.Tk):
                     page_width_mm=self.config_obj.pdf_page_width_mm or None,
                     upscale=self.config_obj.pdf_upscale,
                     sharpen=self.config_obj.pdf_sharpen,
+                    optimize=self.config_obj.pdf_optimize,
                 )
             except PdfExportError as exc:
                 self._emit("pdf_failed", str(exc))

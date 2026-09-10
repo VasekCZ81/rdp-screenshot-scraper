@@ -103,6 +103,9 @@ class AppConfig:
     pdf_upscale: float = 1.0
     # Doostření (unsharp mask) v procentech; 0 = vypnuto, rozumně 80-150.
     pdf_sharpen: float = 0.0
+    # Bezeztrátové zmenšení PDF indexovanou paletou. Obraz zůstává bit po bitu
+    # stejný, na snímcích vzdálené plochy ušetří zhruba čtvrtinu velikosti.
+    pdf_optimize: bool = True
     save_duplicates: bool = True         # ukládat potvrzovací duplicity do duplicates/
 
     # --- snímaná oblast ---
@@ -149,6 +152,7 @@ class AppConfig:
             mask_mod.normalize_rects(self.mask_rects)
         )
         self.region = _clean_region(self.region)
+        self.pdf_optimize = bool(self.pdf_optimize)
         self.ocr_enabled = bool(self.ocr_enabled)
         self.ocr_language = str(self.ocr_language).strip() or "cs"
         # Nad 4× už jen roste čas a velikost, kvalita ne.

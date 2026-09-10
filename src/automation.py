@@ -563,6 +563,7 @@ class AutomationController:
             page_width_mm=self.config.pdf_page_width_mm or None,
             upscale=self.config.pdf_upscale,
             sharpen=self.config.pdf_sharpen,
+            optimize=self.config.pdf_optimize,
         )
         self._log(f"PDF vytvořeno: {pdf_path}")
         return pdf_path

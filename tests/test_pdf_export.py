@@ -7,12 +7,18 @@ import re
 import tempfile
 import unittest
 
+import zlib  # noqa: E402
+
+from PIL import Image  # noqa: E402
+
 from helpers import make_page, read_bytes as _read  # noqa: E402
 
 from pdf_export import (  # noqa: E402
     MAX_DPI,
+    MAX_PALETTE,
     PdfExportError,
     dpi_for_width,
+    encode_page_image,
     images_to_pdf,
     prepare_image,
 )
@@ -98,7 +104,7 @@ class TestPdfExport(unittest.TestCase):
 
         paths = self._pages(1, size=(64, 48))
         pdf = os.path.join(self.dir, "result.pdf")
-        images_to_pdf(paths, pdf)
+        images_to_pdf(paths, pdf, optimize=False)
         data = _read(pdf)
 
         match = re.search(rb"/Filter /FlateDecode /Length (\d+) >>\nstream\n", data)
@@ -280,6 +286,96 @@ class TestPdfExport(unittest.TestCase):
         images_to_pdf(paths[:1], pdf)
         self.assertNotEqual(first, os.path.getsize(pdf))
         self.assertIn(b"/Count 1", _read(pdf))
+
+
+class TestLosslessOptimisation(unittest.TestCase):
+    """Indexovaná paleta smí soubor zmenšit, ale ne změnit jediný pixel."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def _rebuild(data: bytes, colorspace: str, size) -> Image.Image:
+        """Složí obrázek zpět z PDF streamu a palety v colorspace."""
+        table = bytes.fromhex(colorspace[colorspace.index("<") + 1 : colorspace.index(">")])
+        indexed = Image.frombytes("P", size, zlib.decompress(data))
+        indexed.putpalette(table)
+        return indexed.convert("RGB")
+
+    def test_palette_roundtrip_is_bit_exact(self):
+        image = make_page(3, (200, 150))
+        data, colorspace, how = encode_page_image(image, optimize=True)
+        self.assertTrue(how.startswith("paleta"), how)
+        self.assertIn("/Indexed /DeviceRGB", colorspace)
+        rebuilt = self._rebuild(data, colorspace, image.size)
+        self.assertEqual(rebuilt.tobytes(), image.tobytes())
+
+    def test_palette_is_smaller_than_devicergb(self):
+        image = make_page(5, (400, 300))
+        small, _cs, _how = encode_page_image(image, optimize=True)
+        plain, _cs2, _how2 = encode_page_image(image, optimize=False)
+        self.assertLess(len(small), len(plain))
+
+    def test_colourful_page_falls_back_to_devicergb(self):
+        """Nad 256 barev paleta nestačí – stránka se uloží jako dosud."""
+        image = Image.new("RGB", (64, 64))
+        pixels = image.load()
+        for y in range(64):
+            for x in range(64):
+                index = y * 64 + x
+                pixels[x, y] = (index % 256, (index // 256) % 256, (index * 7) % 256)
+        self.assertIsNone(image.getcolors(maxcolors=MAX_PALETTE))
+        _data, colorspace, how = encode_page_image(image, optimize=True)
+        self.assertEqual(colorspace, "/DeviceRGB")
+        self.assertEqual(how, "DeviceRGB")
+
+    def test_disabled_keeps_the_original_encoding(self):
+        image = make_page(1, (120, 90))
+        data, colorspace, how = encode_page_image(image, optimize=False)
+        self.assertEqual(colorspace, "/DeviceRGB")
+        self.assertEqual(how, "DeviceRGB")
+        self.assertEqual(zlib.decompress(data), image.tobytes())
+
+    def test_pdf_with_palette_keeps_pixels(self):
+        """Celé PDF: stream stránky se musí složit zpět na původní pixely."""
+        source = make_page(2, (128, 96))
+        path = os.path.join(self.dir, "page_0001.png")
+        source.save(path, "PNG")
+        pdf = os.path.join(self.dir, "result.pdf")
+        images_to_pdf([path], pdf, optimize=True)
+        data = _read(pdf)
+
+        self.assertIn(b"/Indexed /DeviceRGB", data)
+        self.assertNotIn(b"DCTDecode", data)
+        match = re.search(
+            rb"/ColorSpace \[/Indexed /DeviceRGB (\d+) <([0-9A-F]+)>\] "
+            rb"/BitsPerComponent 8 /Filter /FlateDecode /Length (\d+) >>\nstream\n",
+            data,
+        )
+        self.assertIsNotNone(match, "XObject s paletou v PDF nenalezen")
+        hival, table_hex, length = int(match.group(1)), match.group(2), int(match.group(3))
+        stream = data[match.end() : match.end() + length]
+        self.assertEqual(len(table_hex) // 2, (hival + 1) * 3)
+
+        indexed = Image.frombytes("P", source.size, zlib.decompress(stream))
+        indexed.putpalette(bytes.fromhex(table_hex.decode("ascii")))
+        self.assertEqual(indexed.convert("RGB").tobytes(), source.tobytes())
+
+    def test_pdf_is_smaller_with_optimisation(self):
+        paths = []
+        for index in range(3):
+            path = os.path.join(self.dir, f"page_{index + 1:04d}.png")
+            make_page(index, (600, 800)).save(path, "PNG")
+            paths.append(path)
+        plain = os.path.join(self.dir, "plain.pdf")
+        small = os.path.join(self.dir, "small.pdf")
+        images_to_pdf(paths, plain, optimize=False)
+        images_to_pdf(paths, small, optimize=True)
+        self.assertLess(os.path.getsize(small), os.path.getsize(plain))
 
 
 if __name__ == "__main__":
