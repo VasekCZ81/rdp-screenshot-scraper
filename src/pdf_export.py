@@ -581,13 +581,10 @@ def images_to_pdf(
 
             info_id = alloc()
             stamp = time.strftime("D:%Y%m%d%H%M%S")
+            # Bez /Producer: o použitém nástroji nemá výsledné PDF nic říkat.
             write_obj(
                 info_id,
-                b"<< /Producer ("
-                + _escape("RDP Screenshot Scraper")
-                + b") /CreationDate ("
-                + _escape(stamp)
-                + b") >>",
+                b"<< /CreationDate (" + _escape(stamp) + b") >>",
             )
 
             if log and words_total:
