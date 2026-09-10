@@ -18,7 +18,6 @@ CAPTURES_DIRNAME = "captures"
 LOG_FILENAME = "scraper.log"
 DUPLICATES_DIRNAME = "duplicates"
 MASKED_DIRNAME = "masked"
-STITCHED_DIRNAME = "stitched"
 PAGE_PREFIX = "page_"
 PAGE_DIGITS = 4
 
@@ -89,12 +88,12 @@ class AppConfig:
     rdp_host: str = ""
     page_down_method: str = "sendinput"  # "sendinput" | "postmessage"
 
-    # --- posuv dokumentu ---
-    scroll_key: str = "pagedown"         # klávesa, kterou se posouvá
-    scroll_presses: int = 1              # kolik stisků na jeden krok
-    scroll_press_delay_ms: int = 30      # pauza mezi opakovanými stisky
-    scroll_calibrate: bool = False       # dopočítat počet stisků z překryvu
-    scroll_target_ratio: float = 0.85    # cílový krok jako podíl výšky oblasti
+    # --- rozlišení zakládané RDP relace ---
+    # Určuje kvalitu výsledku: strop DPI = výška relace / 11,69" pro A4.
+    # U už běžící relace ho zvětšit nelze, proto se relace zakládá z .rdp.
+    rdp_width: int = 2560
+    rdp_height: int = 3600
+
     pdf_dpi: int = 96                    # DPI použité pro velikost stránky PDF
     # Fyzická šířka snímané předlohy v mm. Kladná hodnota má přednost před
     # pdf_dpi – rozlišení stránky se dopočítá ze šířky snímku (A4 = 210).
@@ -106,13 +105,14 @@ class AppConfig:
     pdf_sharpen: float = 0.0
     save_duplicates: bool = True         # ukládat potvrzovací duplicity do duplicates/
 
+    # --- snímaná oblast ---
+    # [x, y, šířka, výška] v pixelech client rectu okna RDP. Souřadnice jsou
+    # vázané na okno, ne na plochu, takže platí i po dalším spuštění.
+    region: list = field(default_factory=list)
+
     # --- vymazání oblasti ze všech stránek ---
     # Obdélníky [x, y, šířka, výška] v pixelech snímané oblasti.
     mask_rects: list = field(default_factory=list)
-
-    # --- skládání snímků (zoom v prohlížeči > jedna obrazovka na stránku) ---
-    stitch_enabled: bool = False         # složit překrývající se snímky do stránek
-    stitch_page_height_px: int = 0       # 0 = poměr A4 podle šířky pásu
 
     # --- OCR (vestavěný engine Windows) ---
     ocr_enabled: bool = True             # vložit do PDF neviditelnou textovou vrstvu
@@ -136,14 +136,11 @@ class AppConfig:
         self.pdf_page_width_mm = max(0.0, min(2000.0, float(self.pdf_page_width_mm)))
         if self.page_down_method not in ("sendinput", "postmessage"):
             self.page_down_method = "sendinput"
-        import window_manager as wm_mod
+        import rdp_session as rdp_mod
 
-        key = str(self.scroll_key).strip().lower()
-        self.scroll_key = key if key in wm_mod.SCROLL_KEYS else wm_mod.DEFAULT_SCROLL_KEY
-        self.scroll_presses = max(1, min(200, int(self.scroll_presses)))
-        self.scroll_press_delay_ms = max(0, min(1000, int(self.scroll_press_delay_ms)))
-        self.scroll_calibrate = bool(self.scroll_calibrate)
-        self.scroll_target_ratio = max(0.2, min(0.98, float(self.scroll_target_ratio)))
+        self.rdp_width, self.rdp_height = rdp_mod.clamp_resolution(
+            self.rdp_width, self.rdp_height
+        )
         # Prázdná adresa je platný stav – znamená „uživatel ještě nezadal“.
         self.rdp_host = str(self.rdp_host).strip()
         import mask as mask_mod
@@ -151,8 +148,7 @@ class AppConfig:
         self.mask_rects = mask_mod.rects_to_config(
             mask_mod.normalize_rects(self.mask_rects)
         )
-        self.stitch_enabled = bool(self.stitch_enabled)
-        self.stitch_page_height_px = max(0, min(60000, int(self.stitch_page_height_px)))
+        self.region = _clean_region(self.region)
         self.ocr_enabled = bool(self.ocr_enabled)
         self.ocr_language = str(self.ocr_language).strip() or "cs"
         # Nad 4× už jen roste čas a velikost, kvalita ne.
@@ -192,6 +188,17 @@ class AppConfig:
             return True
         except OSError:
             return False
+
+
+def _clean_region(value) -> list:
+    """Ověří uloženou oblast. Cokoli nesmyslného zahodí (= nevybráno)."""
+    try:
+        x, y, width, height = (int(v) for v in value)
+    except (TypeError, ValueError):
+        return []
+    if width <= 0 or height <= 0 or x < 0 or y < 0:
+        return []
+    return [x, y, width, height]
 
 
 def page_filename(index: int) -> str:

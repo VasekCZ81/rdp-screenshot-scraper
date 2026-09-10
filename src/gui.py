@@ -14,6 +14,7 @@ import config as cfg_mod
 import hotkey as hotkey_mod
 import mask as mask_mod
 import ocr
+import rdp_session as rdp_mod
 import window_manager as wm
 import automation
 from automation import (
@@ -24,15 +25,13 @@ from automation import (
     close_logger,
     ocr_pages,
     mask_captures,
-    stitch_captures,
     setup_session_logger,
 )
 from PIL import Image
 
-from capture import CaptureError, Region
+from capture import CaptureError, Region, fit_to_session, validate_region
 from config import APP_NAME, AppConfig
 from pdf_export import PdfExportError, dpi_for_width, images_to_pdf
-from region_selector import select_region
 
 PAD = 8
 MAX_LOG_LINES = 400
@@ -87,20 +86,42 @@ class WindowPicker(tk.Toplevel):
 
 
 class MaskDialog(tk.Toplevel):
-    """Vyznačení oblastí, které se vymažou ze všech stránek.
+    """Vyznačení obdélníků myší nad zmenšeným náhledem snímku.
 
-    Pracuje nad snímkem první stránky. Souřadnice se ukládají v pixelech
-    snímané oblasti, takže platí pro každou další stránku stejně.
+    Používá se dvakrát:
+      * `single=False` – oblasti, které se vymažou ze všech stránek,
+      * `single=True`  – snímaná oblast v rámci okna RDP.
+
+    V obou případech jsou výsledné souřadnice pixely předloženého obrázku,
+    takže volající ví, k čemu se vztahují. Kreslí se do obrazu okna, ne do
+    plochy monitoru – označit tak lze i tu část relace, která leží mimo
+    obrazovku.
     """
 
     MAX_WIDTH = 1100
     MAX_HEIGHT = 760
 
-    def __init__(self, master: tk.Misc, image, rects: list[mask_mod.MaskRect]) -> None:
+    DEFAULT_TITLE = "Oblast k vymazání ze všech stránek"
+    DEFAULT_PROMPT = (
+        "Tažením myši označte oblast, která se má na všech stránkách "
+        "nahradit bílou plochou.\nMůžete označit i více oblastí."
+    )
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        image,
+        rects: list[mask_mod.MaskRect],
+        title: str | None = None,
+        prompt: str | None = None,
+        single: bool = False,
+    ) -> None:
         super().__init__(master)
-        self.title("Oblast k vymazání ze všech stránek")
+        self.title(title or self.DEFAULT_TITLE)
         self.resizable(False, False)
         self.result: list[mask_mod.MaskRect] | None = None
+        self._single = single
+        self._prompt = prompt or self.DEFAULT_PROMPT
         self._rects = list(rects)
         self._image_size = image.size
         self._start: tuple[int, int] | None = None
@@ -121,14 +142,9 @@ class MaskDialog(tk.Toplevel):
         view.save(preview_path, "PNG")
         self._photo = tk.PhotoImage(file=preview_path)
 
-        ttk.Label(
-            self,
-            text=(
-                "Tažením myši označte oblast, která se má na všech stránkách "
-                "nahradit bílou plochou.\nMůžete označit i více oblastí."
-            ),
-            justify="left",
-        ).pack(anchor="w", padx=PAD, pady=(PAD, 4))
+        ttk.Label(self, text=self._prompt, justify="left").pack(
+            anchor="w", padx=PAD, pady=(PAD, 4)
+        )
 
         self.canvas = tk.Canvas(
             self,
@@ -180,10 +196,17 @@ class MaskDialog(tk.Toplevel):
                 tags="mask",
             )
         width, height = self._image_size
-        self.var_info.set(
-            f"Snímek {width}x{height} px, náhled {self._scale * 100:.0f} %   |   "
-            f"označených oblastí: {len(self._rects)}"
-        )
+        if self._single:
+            chosen = str(self._rects[0]) if self._rects else "nevybráno"
+            self.var_info.set(
+                f"Okno RDP {width}x{height} px, náhled {self._scale * 100:.0f} %"
+                f"   |   oblast: {chosen}"
+            )
+        else:
+            self.var_info.set(
+                f"Snímek {width}x{height} px, náhled {self._scale * 100:.0f} %   |   "
+                f"označených oblastí: {len(self._rects)}"
+            )
 
     def _on_press(self, event: tk.Event) -> None:
         self._start = (event.x, event.y)
@@ -213,7 +236,11 @@ class MaskDialog(tk.Toplevel):
         x1, y1 = self._to_image(right, bottom)
         rect = mask_mod.MaskRect(x0, y0, x1 - x0, y1 - y0).clipped(*self._image_size)
         if rect is not None:
-            self._rects.append(rect)
+            if self._single:
+                # Snímaná oblast je vždycky jen jedna – nový tah nahradí starou.
+                self._rects = [rect]
+            else:
+                self._rects.append(rect)
         self._redraw()
 
     def _undo(self) -> None:
@@ -256,15 +283,13 @@ class SettingsDialog(tk.Toplevel):
         ("pixel_threshold", "Tolerance průměrného rozdílu (0.0-1.0)", float),
         ("changed_threshold", "Tolerance podílu změněných pixelů", float),
         ("pdf_dpi", "DPI stránky PDF", int),
-        ("stitch_page_height_px", "Výška složené stránky [px] (0 = A4)", int),
         ("pdf_page_width_mm", "Šířka předlohy [mm] (0 = použít DPI)", float),
         ("pdf_upscale", "Zvětšení snímku pro PDF (1 = vypnuto)", float),
         ("pdf_sharpen", "Doostření pro PDF [%] (0 = vypnuto)", float),
         ("ocr_upscale", "Zvětšení snímku pro OCR (1 = vypnuto)", float),
         ("rdp_host", "Adresa RDP relace (povinné)", str),
-        ("scroll_presses", "Stisků klávesy na jeden posuv", int),
-        ("scroll_press_delay_ms", "Pauza mezi stisky [ms]", int),
-        ("scroll_target_ratio", "Cílový krok (podíl výšky oblasti)", float),
+        ("rdp_width", "Šířka zakládané RDP relace [px]", int),
+        ("rdp_height", "Výška zakládané RDP relace [px]", int),
     ]
 
     def __init__(
@@ -302,39 +327,6 @@ class SettingsDialog(tk.Toplevel):
         self._update_dpi_hint()
 
         row += 1
-        self._scroll_key = tk.StringVar(value=config.scroll_key)
-        ttk.Label(frame, text="Klávesa posuvu dokumentu").grid(
-            row=row, column=0, sticky="w", pady=2
-        )
-        ttk.Combobox(
-            frame,
-            textvariable=self._scroll_key,
-            values=sorted(wm.SCROLL_KEYS),
-            state="readonly",
-            width=16,
-        ).grid(row=row, column=1, sticky="e", padx=(PAD, 0), pady=2)
-
-        row += 1
-        self._scroll_calibrate = tk.BooleanVar(value=config.scroll_calibrate)
-        ttk.Checkbutton(
-            frame,
-            text="Dopočítat počet stisků z naměřeného posuvu",
-            variable=self._scroll_calibrate,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
-
-        row += 1
-        ttk.Label(
-            frame,
-            text=(
-                "Skládání snímků potřebuje, aby se sousední snímky překrývaly.\n"
-                "Jeden Page Down bývá na celou obrazovku, proto zvolte menší\n"
-                "klávesu (šipka dolů) a nechte si počet stisků dopočítat."
-            ),
-            foreground="#555555",
-            justify="left",
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 4))
-
-        row += 1
         self._method = tk.StringVar(value=config.page_down_method)
         ttk.Label(frame, text="Metoda odeslání Page Down").grid(
             row=row, column=0, sticky="w", pady=2
@@ -359,26 +351,6 @@ class SettingsDialog(tk.Toplevel):
         ttk.Separator(frame, orient="horizontal").grid(
             row=row, column=0, columnspan=2, sticky="ew", pady=(8, 4)
         )
-
-        row += 1
-        self._stitch_enabled = tk.BooleanVar(value=config.stitch_enabled)
-        ttk.Checkbutton(
-            frame,
-            text="Skládat překrývající se snímky do celých stránek",
-            variable=self._stitch_enabled,
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 2))
-
-        row += 1
-        ttk.Label(
-            frame,
-            text=(
-                "Zapněte, když v prohlížeči zvětšíte zoom natolik, že se stránka\n"
-                "nevejde na jednu obrazovku. Snímky se podle překryvu poskládají\n"
-                "zpět a rozříznou v nejsvětlejším místě. Pořízená PNG zůstanou."
-            ),
-            foreground="#555555",
-            justify="left",
-        ).grid(row=row, column=0, columnspan=2, sticky="w", pady=(0, 6))
 
         row += 1
         ttk.Separator(frame, orient="horizontal").grid(
@@ -513,10 +485,7 @@ class SettingsDialog(tk.Toplevel):
         for key, value in values.items():
             setattr(self.config_obj, key, value)
         self.config_obj.page_down_method = self._method.get()
-        self.config_obj.scroll_key = self._scroll_key.get()
-        self.config_obj.scroll_calibrate = bool(self._scroll_calibrate.get())
         self.config_obj.save_duplicates = bool(self._save_dups.get())
-        self.config_obj.stitch_enabled = bool(self._stitch_enabled.get())
         self.config_obj.ocr_enabled = bool(self._ocr_enabled.get())
         self.config_obj.ocr_language = self._ocr_language.get()
         self.config_obj.clamp()
@@ -545,6 +514,8 @@ class ScraperApp(tk.Tk):
         self.tc_candidates: list[wm.WindowInfo] = []
         self.rdp_candidates: list[wm.WindowInfo] = []
         self.region: Region | None = None
+        # Umístění okna RDP před roztažením – aby šlo vrátit zpět.
+        self._rdp_placement: dict | None = None
 
         self.controller: AutomationController | None = None
         self.session_dir: str | None = None
@@ -554,7 +525,9 @@ class ScraperApp(tk.Tk):
         self._busy = False  # dlouhá operace mimo automatizaci (např. tvorba PDF)
 
         self._build_ui()
+        self._update_rdp_res_label()
         self.refresh_windows()
+        self._restore_region()
         self._update_mask_label()
         self._update_buttons()
 
@@ -615,8 +588,18 @@ class ScraperApp(tk.Tk):
         self.btn_pick_rdp = ttk.Button(box, text="Vybrat okno…", command=self._pick_rdp, width=14)
         self.btn_pick_rdp.grid(row=1, column=2, sticky="e", pady=(4, 0))
 
-        ttk.Button(box, text="Obnovit seznam oken", command=self.refresh_windows).grid(
-            row=2, column=0, columnspan=3, sticky="w", pady=(PAD, 0)
+        row_buttons = ttk.Frame(box)
+        row_buttons.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(PAD, 0))
+        ttk.Button(
+            row_buttons, text="Obnovit seznam oken", command=self.refresh_windows
+        ).pack(side="left")
+        self.btn_connect = ttk.Button(
+            row_buttons, text="Založit RDP relaci…", command=self._connect_rdp
+        )
+        self.btn_connect.pack(side="left", padx=(6, 0))
+        self.var_rdp_res = tk.StringVar()
+        ttk.Label(row_buttons, textvariable=self.var_rdp_res, foreground="#555555").pack(
+            side="left", padx=(10, 0)
         )
 
         # --- oblast ---
@@ -636,6 +619,10 @@ class ScraperApp(tk.Tk):
             ttk.Label(cell, textvariable=var, font=("Segoe UI", 9, "bold")).pack(
                 side="left", padx=(4, 0)
             )
+        self.btn_fit = ttk.Button(
+            box2, text="Roztáhnout okno RDP", command=self._toggle_stretch
+        )
+        self.btn_fit.grid(row=0, column=4, sticky="e", padx=(0, 6))
         self.btn_region = ttk.Button(box2, text="Vybrat oblast", command=self._select_region)
         self.btn_region.grid(row=0, column=5, sticky="e")
         self.var_mask = tk.StringVar(value="Vymazané oblasti: 0")
@@ -788,31 +775,248 @@ class ScraperApp(tk.Tk):
     # ------------------------------------------------------------------
     # Oblast
     # ------------------------------------------------------------------
+    def _update_rdp_res_label(self) -> None:
+        self.var_rdp_res.set(
+            f"rozlišení relace: {self.config_obj.rdp_width}×{self.config_obj.rdp_height} px"
+        )
+
+    def _connect_rdp(self) -> None:
+        """Založí RDP relaci s pevným rozlišením z Nastavení.
+
+        U už běžící relace rozlišení zvětšit nelze – `mstsc` ho zastropuje
+        velikostí monitoru. Proto se relace zakládá znovu z `.rdp` souboru.
+        """
+        if self._automation_active() or self._busy:
+            return
+        host = self.config_obj.rdp_host
+        if not host:
+            messagebox.showerror(
+                APP_NAME,
+                "Není vyplněna adresa RDP relace.\n\n"
+                "Otevřete Nastavení a zadejte adresu serveru.",
+            )
+            self._open_settings()
+            return
+
+        width, height = self.config_obj.rdp_width, self.config_obj.rdp_height
+        existing = rdp_mod.find_session(host)
+        question = (
+            f"Založit relaci k {host} s rozlišením {width}×{height} px?\n\n"
+        )
+        if existing is not None:
+            question += (
+                "Relace k této adrese už běží. Nové připojení ji převezme – "
+                "otevřené aplikace na serveru zůstanou, jen se přepočítá plocha.\n\n"
+            )
+        question += "Přihlašovací údaje zadáte sám v okně vzdálené plochy."
+        if not messagebox.askyesno(APP_NAME, question):
+            return
+
+        try:
+            path = rdp_mod.write_rdp_file(
+                host, width, height, cfg_mod.get_working_dir()
+            )
+            rdp_mod.launch(path)
+        except rdp_mod.RdpSessionError as exc:
+            messagebox.showerror(APP_NAME, str(exc))
+            return
+
+        self._append_log(f"Spuštěna vzdálená plocha podle {os.path.basename(path)}")
+        self._append_log(f"Čekám na přihlášení k {host} (rozlišení {width}×{height} px)…")
+        self._busy = True
+        self._update_buttons()
+
+        def worker() -> None:
+            window = rdp_mod.wait_for_session(host)
+            self._emit("rdp_connected", window)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_rdp_connected(self, window) -> None:
+        """Doběhlo čekání na okno relace – dokončit nastavení, nebo ohlásit timeout."""
+        self._busy = False
+        if window is None:
+            self._append_log(
+                "Okno RDP relace se neobjevilo. Až se přihlásíte, klikněte na "
+                "„Obnovit seznam oken“."
+            )
+            self._update_buttons()
+            return
+
+        self.rdp_window = window
+        self._rdp_exact = True
+        self._rdp_placement = None
+        self.refresh_windows()
+        self._append_log(f"RDP relace připojena: {_short(window.title, 60)}")
+
+        size = self._stretch_rdp()
+        if size is None:
+            self._update_buttons()
+            return
+        wanted = (self.config_obj.rdp_width, self.config_obj.rdp_height)
+        if size != wanted:
+            messagebox.showwarning(
+                APP_NAME,
+                f"Server přidělil relaci {size[0]}×{size[1]} px místo "
+                f"požadovaných {wanted[0]}×{wanted[1]} px.\n\n"
+                "Snímat to nebrání, jen vyjde nižší rozlišení stránky. "
+                "Zkuste zadat menší hodnotu – starší servery odmítají "
+                "výšku nad 2048 px.",
+            )
+        self._update_buttons()
+
+    def _stretch_rdp(self, log_only_on_change: bool = False) -> tuple[int, int] | None:
+        """Roztáhne okno RDP na celou plochu relace. Vrací rozměr client rectu.
+
+        Myší to udělat nejde – okno musí přesahovat pod dolní okraj monitoru,
+        kam se okraj okna táhnout nedá. Původní umístění si zapamatujeme, aby
+        šlo tlačítkem vrátit.
+        """
+        if self.rdp_window is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Není vybrané okno RDP relace. Klikněte na „Obnovit okna“.",
+            )
+            return None
+        hwnd = self.rdp_window.hwnd
+        before = wm.client_rect(hwnd)[2:]
+        if self._rdp_placement is None:
+            self._rdp_placement = wm.get_placement(hwnd)
+        try:
+            size = fit_to_session(
+                hwnd, log=lambda message: self._emit("log", message)
+            )
+        except CaptureError as exc:
+            messagebox.showerror(APP_NAME, f"Okno RDP se nepodařilo roztáhnout.\n\n{exc}")
+            return None
+        if not log_only_on_change or size != before:
+            self._append_log(
+                f"Okno RDP roztaženo: plocha relace {size[0]}x{size[1]} px"
+            )
+        self._update_buttons()
+        return size
+
+    def _restore_rdp(self) -> None:
+        """Vrátí okno RDP tam, kde bylo před roztažením."""
+        if self.rdp_window is None or self._rdp_placement is None:
+            return
+        if wm.set_placement(self.rdp_window.hwnd, self._rdp_placement):
+            self._append_log("Okno RDP vráceno na původní velikost.")
+        self._rdp_placement = None
+        self._update_buttons()
+
+    def _toggle_stretch(self) -> None:
+        if self._automation_active() or self._busy:
+            return
+        if self._rdp_placement is None:
+            self._stretch_rdp()
+        else:
+            self._restore_rdp()
+
+    def _restore_region(self) -> None:
+        """Obnoví snímanou oblast z config.json.
+
+        Souřadnice jsou vázané na okno RDP, ne na plochu, takže po restartu
+        aplikace platí dál – pokud okno mezitím nezměnilo velikost. To ověří
+        až start snímání, kde je znám aktuální client rect.
+        """
+        stored = list(self.config_obj.region or [])
+        if len(stored) != 4:
+            return
+        region = Region(*(int(v) for v in stored))
+        self._apply_region(region, quiet=True)
+        self._append_log(f"Oblast z minulého běhu: {region}")
+
+    def _window_snapshot(self):
+        """Snímek celého okna RDP – podklad pro výběr oblasti.
+
+        Jde přes stejné ověření aktivního Total Commanderu jako ostrý běh,
+        takže se výběr chová stejně jako to, co se pak bude snímat.
+        """
+        if self.rdp_window is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Není vybrané okno RDP relace. Klikněte na „Obnovit okna“ "
+                "a vyberte relaci.",
+            )
+            return None
+        if self.tc_window is None:
+            messagebox.showerror(
+                APP_NAME,
+                "Není nalezený Total Commander. Snímek vzniká jen s ním "
+                "v popředí, takže bez něj nelze pořídit ani podklad pro výběr.",
+            )
+            return None
+        try:
+            return automation.capture_single(
+                self.config_obj,
+                self.tc_window.hwnd,
+                self.rdp_window.hwnd,
+                log=lambda message: self._emit("log", message),
+            )
+        except (AutomationError, CaptureError) as exc:
+            messagebox.showerror(APP_NAME, f"Snímek okna RDP se nepodařilo pořídit.\n\n{exc}")
+            return None
+
     def _select_region(self) -> None:
-        if self._automation_active():
+        if self._automation_active() or self._busy:
             return
         self.var_status.set(Status.SELECTING.value)
-        self.withdraw()
-        self.after(150, self._show_overlay)
-
-    def _show_overlay(self) -> None:
-        select_region(self, self._region_selected)
-
-    def _region_selected(self, region: Region | None) -> None:
-        self.deiconify()
-        self.lift()
-        if region is None:
-            self.var_status.set(Status.READY.value)
-            self._append_log("Výběr oblasti zrušen.")
-        else:
-            self.region = region
-            self.var_x.set(str(region.x))
-            self.var_y.set(str(region.y))
-            self.var_w.set(str(region.width))
-            self.var_h.set(str(region.height))
-            self.var_status.set(Status.READY.value)
-            self._append_log(f"Oblast: {region}")
         self._update_buttons()
+        try:
+            # Bez roztažení by šlo označit jen tu část relace, která se vejde
+            # na monitor – zbytek okna je schovaný za posuvníky mstsc.
+            if self._stretch_rdp(log_only_on_change=True) is None:
+                return
+            image = self._window_snapshot()
+            if image is None:
+                return
+
+            current = []
+            if self.region is not None:
+                current = [
+                    mask_mod.MaskRect(
+                        self.region.x, self.region.y,
+                        self.region.width, self.region.height,
+                    )
+                ]
+            dialog = MaskDialog(
+                self,
+                image,
+                current,
+                title="Snímaná oblast v okně RDP",
+                prompt=(
+                    "Tažením myši označte oblast, která se má snímat – typicky "
+                    "samotnou stránku dokumentu\nbez panelů prohlížeče. "
+                    "Souřadnice platí v okně RDP, takže vydrží i po restartu "
+                    "aplikace."
+                ),
+                single=True,
+            )
+            image.close()
+            self.wait_window(dialog)
+            if dialog.result is None:
+                self._append_log("Výběr oblasti zrušen.")
+                return
+            if not dialog.result:
+                self._append_log("Nebyla označena žádná oblast.")
+                return
+            rect = dialog.result[0]
+            self._apply_region(Region(rect.x, rect.y, rect.width, rect.height))
+        finally:
+            self.var_status.set(Status.READY.value)
+            self._update_buttons()
+
+    def _apply_region(self, region: Region, quiet: bool = False) -> None:
+        self.region = region
+        self.var_x.set(str(region.x))
+        self.var_y.set(str(region.y))
+        self.var_w.set(str(region.width))
+        self.var_h.set(str(region.height))
+        self.config_obj.region = [region.x, region.y, region.width, region.height]
+        self.config_obj.save()
+        if not quiet:
+            self._append_log(f"Oblast v okně RDP: {region}")
 
     # ------------------------------------------------------------------
     # Oblast k vymazání
@@ -828,11 +1032,16 @@ class ScraperApp(tk.Tk):
 
     def _mask_source_image(self):
         """Snímek první stránky – čerstvý, jinak z poslední relace."""
-        if self.tc_window is not None and self.region is not None:
+        if (
+            self.tc_window is not None
+            and self.rdp_window is not None
+            and self.region is not None
+        ):
             try:
                 return automation.capture_single(
                     self.config_obj,
                     self.tc_window.hwnd,
+                    self.rdp_window.hwnd,
                     self.region,
                     log=lambda message: self._emit("log", message),
                 ), "čerstvý snímek"
@@ -925,7 +1134,27 @@ class ScraperApp(tk.Tk):
             ):
                 return
         if self.region is None:
-            messagebox.showerror(APP_NAME, "Nejprve vyberte oblast obrazovky.")
+            messagebox.showerror(
+                APP_NAME,
+                "Nejprve vyberte snímanou oblast v okně RDP.",
+            )
+            return
+
+        # Bez roztažení by se snímala jen ta část relace, která se vejde na
+        # monitor. Dělá se před kontrolou oblasti, aby souhlasil client rect.
+        if self._stretch_rdp(log_only_on_change=True) is None:
+            return
+
+        # Oblast je vázaná na okno; když okno mezitím změnilo velikost, nesedí.
+        client = wm.client_rect(self.rdp_window.hwnd)
+        try:
+            validate_region(self.region, (client[2], client[3]))
+        except CaptureError as exc:
+            messagebox.showerror(
+                APP_NAME,
+                f"{exc}\n\nOkno RDP má teď {client[2]}x{client[3]} px. "
+                "Vyberte snímanou oblast znovu.",
+            )
             return
 
         # RDP nesmí být minimalizované
@@ -1036,17 +1265,9 @@ class ScraperApp(tk.Tk):
 
         def worker() -> None:
             try:
-                sources = stitch_captures(
-                    self.config_obj,
-                    pages,
-                    session_dir,
-                    status=lambda text: self._emit("status", text),
-                    log=lambda message: self._emit("log", message),
-                    holes=mask_mod.normalize_rects(self.config_obj.mask_rects),
-                )
                 sources = mask_captures(
                     self.config_obj,
-                    sources,
+                    pages,
                     session_dir,
                     status=lambda text: self._emit("status", text),
                     log=lambda message: self._emit("log", message),
@@ -1099,6 +1320,7 @@ class ScraperApp(tk.Tk):
         self.wait_window(dialog)
         if dialog.saved:
             self._append_log("Nastavení uloženo.")
+            self._update_rdp_res_label()
             self.refresh_windows()
 
     # ------------------------------------------------------------------
@@ -1117,7 +1339,9 @@ class ScraperApp(tk.Tk):
         self.after(80, self._poll_events)
 
     def _handle_event(self, kind: str, payload: object) -> None:
-        if kind == "status":
+        if kind == "rdp_connected":
+            self._on_rdp_connected(payload)
+        elif kind == "status":
             self.var_status.set(str(payload))
         elif kind == "log":
             self._append_log(str(payload))
@@ -1217,11 +1441,20 @@ class ScraperApp(tk.Tk):
         self.btn_resume.configure(state="normal" if paused else "disabled")
         self.btn_stop.configure(state="normal" if running else "disabled")
         self.btn_region.configure(state="disabled" if (running or self._busy) else "normal")
+        self.btn_fit.configure(
+            text=("Vrátit okno RDP" if self._rdp_placement is not None
+                  else "Roztáhnout okno RDP"),
+            state="disabled" if (running or self._busy or self.rdp_window is None)
+            else "normal",
+        )
         self.btn_pdf.configure(
             state="normal" if (has_pages and not running and not self._busy) else "disabled"
         )
         self.btn_pick_tc.configure(state="disabled" if running else "normal")
         self.btn_pick_rdp.configure(state="disabled" if running else "normal")
+        self.btn_connect.configure(
+            state="disabled" if (running or self._busy) else "normal"
+        )
         self.btn_mask.configure(
             state="disabled" if (running or self._busy) else "normal"
         )

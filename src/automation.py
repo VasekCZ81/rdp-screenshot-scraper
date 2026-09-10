@@ -22,9 +22,8 @@ from typing import Callable
 import config as cfg_mod
 import mask as mask_mod
 import ocr
-import stitch
 import window_manager as wm
-from capture import CaptureError, Region, ScreenCapturer, validate_region
+from capture import CaptureError, Region, WindowCapturer, validate_region
 from config import AppConfig
 from image_compare import compare
 from pdf_export import PdfExportError, images_to_pdf
@@ -37,7 +36,6 @@ class Status(str, Enum):
     PAUSED = "Pozastaveno"
     END_DETECTED = "Detekován konec dokumentu"
     MASKING = "Vymazávám oblast"
-    STITCHING = "Skládám snímky"
     OCR = "Provádím OCR"
     MAKING_PDF = "Vytvářím PDF"
     DONE = "Dokončeno"
@@ -56,79 +54,10 @@ class RunTargets:
     region: Region
 
 
-class ScrollStep:
-    """Určuje, kolika stisky klávesy se dokument posune o jeden krok.
-
-    Když je zapnutá kalibrace, začíná se jediným stiskem a podle skutečně
-    naměřeného posuvu se počet stisků dopočítá tak, aby krok vyšel na zvolený
-    podíl výšky snímané oblasti. Sousední snímky pak mají překryv, podle
-    kterého je lze spolehlivě poskládat.
-
-    Krok se určí z **prvního** použitelného měření a dál se už nezvětšuje.
-    Prohlížeč na konci stránky posuv utne, takže by tam vyšel malý posuv a
-    přepočet by počet stisků neomezeně nafukoval. Zkrátit krok se ale smí
-    kdykoli – když překryv zmizí, jde počet stisků na polovinu.
-    """
-
-    MAX_PRESSES = 200
-
-    def __init__(self, config: AppConfig, region_height: int) -> None:
-        self.config = config
-        self.target = max(1.0, region_height * config.scroll_target_ratio)
-        self.calibrating = bool(config.scroll_calibrate)
-        self.presses = 1 if self.calibrating else config.scroll_presses
-        self.pixels_per_press: float | None = None
-        self.calibrated = False
-
-    def _clamp(self, value: int) -> int:
-        return max(1, min(self.MAX_PRESSES, int(value)))
-
-    def observe(self, shift: int | None) -> str | None:
-        """Zohlední naměřený posuv. Vrací hlášku do logu, pokud se krok změnil."""
-        if not self.calibrating:
-            return None
-
-        if shift is None or shift <= 0:
-            if self.presses <= 1:
-                self.calibrating = False
-                return (
-                    "Kalibrace posuvu: ani jediný stisk nedává použitelný překryv, "
-                    "krok zůstává na 1 stisku"
-                )
-            before = self.presses
-            self.presses = self._clamp(self.presses // 2)
-            self.pixels_per_press = None
-            return (
-                f"Kalibrace posuvu: překryv zmizel, zkracuji krok z {before} "
-                f"na {self.presses} stisků"
-            )
-
-        if self.calibrated:
-            # Krok už je určený. Nahoru se nekoriguje: na konci stránky
-            # prohlížeč posuv utne a z takového měření by vyšel nesmysl.
-            return None
-
-        self.pixels_per_press = shift / self.presses
-        wanted = self._clamp(round(self.target / self.pixels_per_press))
-        self.calibrated = True
-        if wanted == self.presses:
-            return (
-                f"Kalibrace posuvu: jeden stisk posune {self.pixels_per_press:.0f} px, "
-                f"krok zůstává na {wanted} stisku"
-            )
-        before = self.presses
-        self.presses = wanted
-        return (
-            f"Kalibrace posuvu: jeden stisk posune {self.pixels_per_press:.0f} px, "
-            f"krok upraven z {before} na {wanted} stisků "
-            f"(cíl {self.target:.0f} px)"
-        )
-
-
 def capture_verified(
     tc_hwnd: int,
     region: Region,
-    capturer: ScreenCapturer,
+    capturer: WindowCapturer,
     config: AppConfig,
     log: Callable[[str], None] | None = None,
     warn: Callable[[str], None] | None = None,
@@ -138,6 +67,9 @@ def capture_verified(
     Aktivuje Total Commander, ověří přes `GetForegroundWindow()`, že je
     skutečně aktivním oknem, a teprve pak snímá. Když ověření neprojde,
     snímek NEVZNIKNE a vyhodí se `AutomationError`.
+
+    Snímá se obsah okna RDP přes `PrintWindow`, takže Total Commander smí okno
+    RDP klidně překrývat – na výsledek to nemá vliv.
     """
     if not wm.is_window(tc_hwnd):
         raise AutomationError("Okno Total Commanderu bylo zavřeno.")
@@ -166,12 +98,19 @@ def capture_verified(
 def capture_single(
     config: AppConfig,
     tc_hwnd: int,
-    region: Region,
+    rdp_hwnd: int,
+    region: Region | None = None,
     log: Callable[[str], None] | None = None,
 ):
-    """Pořídí jeden ověřený snímek – pro náhled a výběr oblasti k vymazání."""
-    validate_region(region)
-    capturer = ScreenCapturer()
+    """Pořídí jeden ověřený snímek – pro náhled a výběr oblastí.
+
+    Bez `region` vrátí celý client rect okna RDP. Právě to potřebuje výběr
+    snímané oblasti: kreslí se do obrazu okna, ne do plochy monitoru, takže
+    lze označit i tu část relace, která leží mimo obrazovku.
+    """
+    if region is not None:
+        validate_region(region)
+    capturer = WindowCapturer(rdp_hwnd)
     try:
         return capture_verified(tc_hwnd, region, capturer, config, log=log)
     finally:
@@ -204,53 +143,6 @@ def mask_captures(
         if log:
             log(f"Vymazání oblasti selhalo, snímky zůstávají beze změny: {exc}")
         return page_files
-
-
-def stitch_captures(
-    config: AppConfig,
-    page_files: list[str],
-    session_dir: str,
-    status: Callable[[str], None] | None = None,
-    log: Callable[[str], None] | None = None,
-    holes: list | None = None,
-) -> list[str]:
-    """Složí překrývající se snímky do stránek. Vrací cesty, které mají jít do PDF.
-
-    Zarovnání i kreslení běží nad **původními** snímky. Vymazané oblasti se
-    předávají jako `holes` – nekreslí se vůbec, takže je vyplní sousední snímek,
-    který na tom místě obsah má. Bílá výplň by po složení padla doprostřed
-    stránky a přepsala by obsah. Samotné vybílení proto obstará až
-    `mask_captures()` nad hotovými stránkami.
-
-    Pořízené snímky zůstávají nedotčené, složené stránky vznikají v podadresáři
-    `stitched/`. Když skládání selže, vrátí se snímky, které do něj vstoupily.
-    """
-    if not config.stitch_enabled or len(page_files) < 2:
-        return page_files
-
-    out_dir = os.path.join(session_dir, cfg_mod.STITCHED_DIRNAME)
-    try:
-        if status:
-            status(Status.STITCHING.value)
-        pages = stitch.stitch_pages(
-            page_files,
-            out_dir,
-            page_height=config.stitch_page_height_px,
-            log=log,
-            holes=holes,
-        )
-    except (stitch.StitchError, OSError, ValueError) as exc:
-        if log:
-            log(f"Skládání selhalo, PDF vznikne z původních snímků: {exc}")
-        return page_files
-
-    if not pages:
-        if log:
-            log("Skládání nevrátilo žádnou stránku, používám původní snímky.")
-        return page_files
-    if log:
-        log(f"Skládání: {len(page_files)} snímků složeno do {len(pages)} stránek")
-    return pages
 
 
 def ocr_pages(
@@ -424,7 +316,7 @@ class AutomationController:
             self._log(f"RDP aktivováno (HWND {hwnd})")
         return ok
 
-    def _capture_with_total_commander(self, capturer: ScreenCapturer):
+    def _capture_with_total_commander(self, capturer: WindowCapturer):
         """Snímek přes společnou `capture_verified()` – jediné místo s tímto právem."""
         image = capture_verified(
             self.targets.tc_hwnd,
@@ -441,12 +333,14 @@ class AutomationController:
     # Hlavní smyčka
     # ------------------------------------------------------------------
     def _run(self) -> None:
-        capturer: ScreenCapturer | None = None
+        capturer: WindowCapturer | None = None
         try:
-            validate_region(self.targets.region)
-            self._log(f"Start snímání, oblast: {self.targets.region}")
+            capturer = WindowCapturer(self.targets.rdp_hwnd)
+            client = capturer.client_size()
+            validate_region(self.targets.region, client)
+            self._log(f"Start snímání, oblast v okně RDP: {self.targets.region}")
             self._log(f"Total Commander: {self.targets.tc_label}")
-            self._log(f"RDP: {self.targets.rdp_label}")
+            self._log(f"RDP: {self.targets.rdp_label}, client {client[0]}x{client[1]} px")
             self._log(
                 "Nastavení: aktivace {a} ms, Page Down {p} ms, potvrzení konce {c}, "
                 "max snímků {m}, metoda kláves {k}".format(
@@ -458,9 +352,6 @@ class AutomationController:
                 )
             )
             self._status(Status.RUNNING)
-
-            # mss musí vzniknout ve vlákně, které snímá
-            capturer = ScreenCapturer()
             self._loop(capturer)
 
         except AutomationError as exc:
@@ -482,15 +373,8 @@ class AutomationController:
             if capturer is not None:
                 capturer.close()
 
-    def _loop(self, capturer: ScreenCapturer) -> None:
+    def _loop(self, capturer: WindowCapturer) -> None:
         cfg = self.config
-
-        step = ScrollStep(cfg, self.targets.region.height)
-        if cfg.scroll_calibrate:
-            self._log(
-                "Kalibrace posuvu zapnuta – počet stisků se dopočítá z prvního "
-                f"naměřeného posuvu (cíl {step.target:.0f} px)"
-            )
 
         # Krok 0 – výchozí pozice dokumentu (aktivace TC + ověření + snímek)
         previous = self._capture_with_total_commander(capturer)
@@ -524,19 +408,10 @@ class AutomationController:
                     "RDP přestalo být aktivním oknem – Page Down nebyl odeslán."
                 )
             try:
-                wm.send_key(
-                    self.targets.rdp_hwnd,
-                    cfg.scroll_key,
-                    cfg.page_down_method,
-                    presses=step.presses,
-                    delay_ms=cfg.scroll_press_delay_ms,
-                )
+                wm.send_page_down(self.targets.rdp_hwnd, cfg.page_down_method)
             except (OSError, ValueError) as exc:
-                raise AutomationError(f"Odeslání klávesy posuvu selhalo: {exc}") from exc
-            self._log(
-                cfg.scroll_key
-                + (f" ×{step.presses}" if step.presses > 1 else "")
-            )
+                raise AutomationError(f"Odeslání Page Down selhalo: {exc}") from exc
+            self._log("Page Down")
 
             # Krok 3 – čekání na překreslení obsahu
             self._sleep(cfg.page_down_delay_ms / 1000.0)
@@ -545,12 +420,6 @@ class AutomationController:
 
             # Krok 4 – zpět na Total Commander, ověřit a teprve pak snímat
             current = self._capture_with_total_commander(capturer)
-
-            if step.calibrating:
-                measured, _error = stitch.find_shift(previous, current)
-                message = step.observe(measured)
-                if message:
-                    self._log(message)
 
             # Krok 5 – porovnání s předchozím snímkem
             result = compare(
@@ -668,18 +537,9 @@ class AutomationController:
         name = os.path.basename(self.session_dir.rstrip("\\/"))
         pdf_path = os.path.join(self.session_dir, f"RDP_capture_{name}.pdf")
 
-        pages = stitch_captures(
-            self.config,
-            self.page_files,
-            self.session_dir,
-            status=lambda text: self.emit("status", text),
-            log=self._log,
-            holes=mask_mod.normalize_rects(self.config.mask_rects),
-        )
-
         pages = mask_captures(
             self.config,
-            pages,
+            self.page_files,
             self.session_dir,
             status=lambda text: self.emit("status", text),
             log=self._log,

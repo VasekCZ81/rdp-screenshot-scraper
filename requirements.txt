@@ -11,7 +11,8 @@
 # pywin32 proto není potřeba. GUI staví na tkinter, který je součástí Pythonu.
 
 # --- běh aplikace ---
-mss==10.2.0
+# Snímá se přes PrintWindow (ctypes), desktopové snímání přes mss už není
+# potřeba – viz src/capture.py.
 Pillow==12.3.0
 
 # --- sestavení .exe (build.bat) ---

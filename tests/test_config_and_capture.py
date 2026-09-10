@@ -9,9 +9,12 @@ import unittest
 from unittest import mock
 
 import helpers  # noqa: F401  (nastaví sys.path na ./src)
+from PIL import Image, ImageDraw  # noqa: E402
 
 import config as cfg_mod  # noqa: E402
-from capture import CaptureError, Region, validate_region  # noqa: E402
+from capture import (  # noqa: E402
+    CaptureError, Region, looks_blank, session_bounds, validate_region,
+)
 from config import AppConfig, page_filename  # noqa: E402
 
 
@@ -119,17 +122,91 @@ class TestRegionValidation(unittest.TestCase):
         with self.assertRaises(CaptureError):
             validate_region(Region(10, 10, 100, -3))
 
-    def test_region_outside_all_monitors(self):
+    def test_region_outside_the_window(self):
+        """Oblast musí ležet uvnitř client rectu okna RDP."""
         with self.assertRaises(CaptureError):
-            validate_region(Region(500000, 500000, 100, 100))
+            validate_region(Region(100, 100, 3000, 100), (2560, 3600))
+        with self.assertRaises(CaptureError):
+            validate_region(Region(100, 3550, 100, 100), (2560, 3600))
+
+    def test_negative_coordinates_are_rejected(self):
+        """Souřadnice jsou v rámci okna, záporné být nemohou."""
+        with self.assertRaises(CaptureError):
+            validate_region(Region(-1, 0, 100, 100))
 
     def test_valid_region_passes(self):
         validate_region(Region(0, 0, 50, 50))
+        validate_region(Region(11, 45, 2400, 3400), (2560, 3600))
 
-    def test_negative_coordinates_are_allowed(self):
-        """Monitor vlevo od primárního má záporné X."""
-        with mock.patch("capture.virtual_screen_rect", lambda: (-1920, 0, 3840, 1080)):
-            validate_region(Region(-1500, 100, 800, 600))
+    def test_region_touching_the_edge_passes(self):
+        validate_region(Region(0, 0, 2560, 3600), (2560, 3600))
+
+
+class TestBlankDetection(unittest.TestCase):
+    """Černý snímek je selhání capture, bílá stránka legitimní obsah."""
+
+    def test_black_frame_is_blank(self):
+        self.assertTrue(looks_blank(Image.new("RGB", (400, 300), (0, 0, 0))))
+
+    def test_almost_black_frame_is_blank(self):
+        self.assertTrue(looks_blank(Image.new("RGB", (400, 300), (3, 3, 4))))
+
+    def test_white_page_is_not_blank(self):
+        self.assertFalse(looks_blank(Image.new("RGB", (400, 300), (255, 255, 255))))
+
+    def test_page_with_content_is_not_blank(self):
+        image = Image.new("RGB", (400, 300), (255, 255, 255))
+        ImageDraw.Draw(image).rectangle((10, 10, 380, 40), fill=(0, 0, 0))
+        self.assertFalse(looks_blank(image))
+
+
+class TestStoredRegion(unittest.TestCase):
+    """Oblast v config.json je vázaná na okno, takže přežije restart."""
+
+    def test_valid_region_survives_clamp(self):
+        cfg = AppConfig()
+        cfg.region = [11, 45, 2400, 3400]
+        cfg.clamp()
+        self.assertEqual(cfg.region, [11, 45, 2400, 3400])
+
+    def test_broken_region_is_dropped(self):
+        for broken in ([1, 2, 3], [0, 0, 0, 100], [-5, 0, 10, 10], "nesmysl", None):
+            cfg = AppConfig()
+            cfg.region = broken
+            cfg.clamp()
+            self.assertEqual(cfg.region, [], f"nesmyslná oblast {broken!r} má zmizet")
+
+
+class TestSessionBounds(unittest.TestCase):
+    """Menší relaci mstsc vycentruje do černých pruhů – ty je třeba najít."""
+
+    @staticmethod
+    def framed(size, inner_box, colour=(220, 220, 220)):
+        image = Image.new("RGB", size, (0, 0, 0))
+        ImageDraw.Draw(image).rectangle(inner_box, fill=colour)
+        return image
+
+    def test_finds_centred_session(self):
+        image = self.framed((2560, 3700), (0, 757, 2559, 2916))
+        box = session_bounds(image)
+        self.assertIsNotNone(box)
+        left, top, right, bottom = box
+        self.assertEqual((right - left, bottom - top), (2560, 2160))
+        self.assertEqual(top, 757)
+
+    def test_finds_horizontal_bands(self):
+        image = self.framed((4400, 2160), (280, 0, 4119, 2159))
+        box = session_bounds(image)
+        self.assertIsNotNone(box)
+        left, _top, right, _bottom = box
+        self.assertEqual((left, right - left), (280, 3840))
+
+    def test_no_bands_returns_none(self):
+        image = Image.new("RGB", (2560, 3600), (200, 200, 200))
+        self.assertIsNone(session_bounds(image))
+
+    def test_all_black_returns_none(self):
+        self.assertIsNone(session_bounds(Image.new("RGB", (800, 600), (0, 0, 0))))
 
 
 if __name__ == "__main__":

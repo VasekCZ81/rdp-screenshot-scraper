@@ -27,6 +27,29 @@ kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 SW_RESTORE = 9
 SW_SHOW = 5
 GA_ROOT = 2
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+MONITOR_DEFAULTTONEAREST = 2
+
+
+class MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("rcMonitor", wt.RECT),
+        ("rcWork", wt.RECT),
+        ("dwFlags", wt.DWORD),
+    ]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wt.UINT),
+        ("flags", wt.UINT),
+        ("showCmd", wt.UINT),
+        ("ptMinPosition", wt.POINT),
+        ("ptMaxPosition", wt.POINT),
+        ("rcNormalPosition", wt.RECT),
+    ]
 
 VK_NEXT = 0x22  # Page Down
 
@@ -312,6 +335,118 @@ def is_iconic(hwnd: int) -> bool:
 
 def restore_window(hwnd: int) -> None:
     user32.ShowWindow(hwnd, SW_RESTORE)
+
+
+def is_zoomed(hwnd: int) -> bool:
+    """True pro maximalizované okno."""
+    return bool(user32.IsZoomed(hwnd))
+
+
+def window_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """(x, y, šířka, výška) celého okna ve fyzických pixelech."""
+    rect = wt.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return (0, 0, 0, 0)
+    return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+
+def client_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """(x, y, šířka, výška) client rectu; x/y jsou souřadnice na ploše.
+
+    Client rect může sahat mimo obrazovku – okno RDP je záměrně vyšší než
+    monitor, aby se do relace vešla celá stránka. Snímá se přes PrintWindow,
+    takže na tom nezáleží.
+    """
+    size = wt.RECT()
+    if not user32.GetClientRect(hwnd, ctypes.byref(size)):
+        return (0, 0, 0, 0)
+    origin = wt.POINT(0, 0)
+    user32.ClientToScreen(hwnd, ctypes.byref(origin))
+    return (origin.x, origin.y, size.right, size.bottom)
+
+
+def client_offset(hwnd: int) -> tuple[int, int]:
+    """Posun client rectu vůči levému hornímu rohu okna (rám a titulek)."""
+    wx, wy, _, _ = window_rect(hwnd)
+    cx, cy, _, _ = client_rect(hwnd)
+    return (cx - wx, cy - wy)
+
+
+def monitor_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """(x, y, šířka, výška) monitoru, na kterém okno převážně leží."""
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    if not monitor or not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+        width, height = primary_screen_size()
+        return (0, 0, width, height)
+    rect = info.rcMonitor
+    return (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top)
+
+
+def set_window_geometry(
+    hwnd: int, x: int, y: int, width: int, height: int
+) -> tuple[int, int, int, int]:
+    """Přesune a zvětší okno; vrací rozměry, které okno skutečně přijalo.
+
+    Okno smí přesahovat mimo obrazovku – právě tím se do relace RDP vejde
+    stránka vyšší, než je monitor. Aplikace okno nikdy neaktivuje
+    (`SWP_NOACTIVATE`), aby si nepřebrala fokus.
+    """
+    user32.SetWindowPos(
+        hwnd, 0, int(x), int(y), int(width), int(height),
+        SWP_NOZORDER | SWP_NOACTIVATE,
+    )
+    return window_rect(hwnd)
+
+
+def get_placement(hwnd: int) -> dict | None:
+    """Uloží umístění okna, aby šlo později přesně vrátit."""
+    placement = WINDOWPLACEMENT()
+    placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+    if not user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+        return None
+    rect = placement.rcNormalPosition
+    return {
+        "flags": int(placement.flags),
+        "showCmd": int(placement.showCmd),
+        "normal": [rect.left, rect.top, rect.right, rect.bottom],
+    }
+
+
+def set_placement(hwnd: int, saved: dict | None) -> bool:
+    """Vrátí okno tam, kde bylo před zvětšením."""
+    if not saved or not is_window(hwnd):
+        return False
+    placement = WINDOWPLACEMENT()
+    placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+    placement.flags = int(saved.get("flags", 0))
+    placement.showCmd = int(saved.get("showCmd", SW_SHOW))
+    left, top, right, bottom = saved["normal"]
+    placement.rcNormalPosition = wt.RECT(left, top, right, bottom)
+    return bool(user32.SetWindowPlacement(hwnd, ctypes.byref(placement)))
+
+
+def wait_for_stable_size(
+    hwnd: int, timeout_s: float = 4.0, quiet_s: float = 0.45
+) -> tuple[int, int]:
+    """Počká, až se velikost okna přestane měnit.
+
+    Po změně velikosti okna vyjednává `mstsc` se serverem novou plochu relace,
+    což chvíli trvá. Pevná prodleva by byla buď zbytečně dlouhá, nebo krátká.
+    """
+    deadline = time.time() + timeout_s
+    _, _, width, height = window_rect(hwnd)
+    stable_since = time.time()
+    while time.time() < deadline:
+        time.sleep(0.1)
+        _, _, now_w, now_h = window_rect(hwnd)
+        if (now_w, now_h) != (width, height):
+            width, height = now_w, now_h
+            stable_since = time.time()
+        elif time.time() - stable_since >= quiet_s:
+            break
+    return (width, height)
 
 
 def get_foreground_hwnd() -> int:

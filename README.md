@@ -1,8 +1,29 @@
 ﻿# RDP Screenshot Scraper
 
-Windows aplikace, která automaticky pořizuje screenshoty zvolené oblasti obrazovky
-během práce s **již spuštěnou a přihlášenou** RDP relací, posouvá dokument klávesou
-`Page Down`, sama rozpozná konec dokumentu a ze snímků sestaví jedno PDF.
+Windows aplikace, která automaticky snímá obsah okna **již spuštěné a přihlášené**
+RDP relace, posouvá dokument klávesou `Page Down`, sama rozpozná konec dokumentu
+a ze snímků sestaví jedno PDF s vyhledatelným textem.
+
+## Snímá se okno, ne obrazovka
+
+Snímek nevzniká z plochy monitoru, ale přímo z okna `mstsc.exe` přes
+`PrintWindow(PW_RENDERFULLCONTENT)` – viz [src/capture.py](src/capture.py).
+Z toho plynou dvě věci, na kterých stojí celá aplikace:
+
+1. **Okno RDP smí být větší než monitor.** Windows vykreslí i tu část okna, která
+   leží mimo obrazovku. Relace může být vysoká 3600 px na monitoru vysokém
+   2160 px – celá stránka PDF se pak vejde do jednoho snímku ve výrazně vyšším
+   rozlišení a nemusí se posouvat ani skládat. Jak takovou relaci založit, popisuje
+   [Rozlišení – jak dostat ostrý obraz](#rozlišení--jak-dostat-ostrý-obraz).
+2. **Na okno RDP smí cokoli ležet.** Total Commander je klidně může celé překrývat,
+   snímek to nijak neovlivní.
+
+Souřadnice snímané oblasti jsou proto pixely **client rectu okna RDP**, ne
+souřadnice plochy. Nezávisí tak na tom, kde okno leží, a vydrží i po restartu
+aplikace – ukládají se do `config.json`.
+
+Desktopové snímání (`mss`, `BitBlt` nad plochou) se nepoužívá ani jako tichý
+fallback: vracelo by obsah překrývajícího okna nebo černou plochu.
 
 ## Klíčová podmínka
 
@@ -48,9 +69,10 @@ Nebo jedním příkazem, který si prostředí připraví sám:
 run.bat
 ```
 
-Aplikace nepotřebuje `pywin32` – práce s Win32 API je řešena přes `ctypes` ze
-standardní knihovny. Za běhu jsou potřeba pouze `mss` (screenshoty) a
-`Pillow` (obrázky). GUI staví na `tkinter`, který je součástí instalace Pythonu.
+Aplikace nepotřebuje `pywin32` – práce s Win32 API včetně snímání okna je
+řešena přes `ctypes` ze standardní knihovny. Za běhu je potřeba jediná
+knihovna, `Pillow` (obrázky). GUI staví na `tkinter`, který je součástí
+instalace Pythonu.
 
 ## Build
 
@@ -100,35 +122,65 @@ Testy simulují Win32 vrstvu, takže běží bez Total Commanderu i bez RDP rela
 > která se objevuje v titulku okna RDP. Hodnota se uloží do `config.json`
 > vedle `.exe`, takže se zadává jen jednou.
 
-1. Spusť **Total Commander**.
-2. Spusť a přihlas se přes **RDP** k svému serveru.
-   *(Aplikace RDP relaci sama nenavazuje.)*
-3. Otevři v RDP dokument na první pozici.
-4. Spusť **RDP Screenshot Scraper**.
-5. V **Nastavení** vyplň **adresu RDP relace** (viz podmínka výše).
-6. Klikni **Vybrat oblast**.
-7. Tažením myši označ oblast dokumentu (`ESC` výběr zruší).
-8. Klikni **Spustit**.
-9. Aplikace postupně pořídí screenshoty.
-10. Po dosažení konce dokumentu vytvoří výsledné PDF s vyhledatelným textem.
+1. Spusť **Total Commander** a **RDP Screenshot Scraper**.
+2. V **Nastavení** vyplň **adresu RDP relace** a případně rozlišení relace
+   (výchozí 2560×3600).
+3. Klikni na **Založit RDP relaci…** a přihlas se. Aplikace relaci založí
+   v rozlišení, které určuje výslednou kvalitu – viz
+   [Rozlišení – jak dostat ostrý obraz](#rozlišení--jak-dostat-ostrý-obraz).
+   *(Máš-li relaci už otevřenou v potřebném rozlišení, stačí
+   **Obnovit seznam oken**.)*
+4. Otevři v RDP dokument na první pozici.
+5. Klikni **Vybrat oblast**. Aplikace nejdřív sama roztáhne okno RDP na celou
+   plochu relace (viz níže), pak pořídí jeho snímek a zobrazí ho zmenšený.
+6. Tažením myši označ v tom snímku oblast dokumentu (`ESC` výběr zruší).
+   Označit lze i tu část relace, která je mimo obrazovku. Volba se uloží do
+   `config.json`, takže příště už se zadávat nemusí.
+7. Klikni **Spustit**.
+8. Aplikace postupně pořídí screenshoty.
+9. Po dosažení konce dokumentu vytvoří výsledné PDF s vyhledatelným textem.
 
 > **Upozornění:** Během automatického snímání uživatel nemá ručně měnit obsah
 > RDP dokumentu ani zavírat Total Commander nebo RDP relaci.
 
+### Roztažení okna RDP
+
+Aby se do snímku vešla celá relace, musí být okno `mstsc.exe` tak velké, aby ji
+pojalo celou – tedy typicky **vyšší než monitor**. Myší to udělat nejde: spodní
+okraj okna se pod dolní hranu obrazovky táhnout nedá.
+
+Slouží k tomu tlačítko **Roztáhnout okno RDP**, které:
+
+1. obnoví okno, pokud je minimalizované nebo maximalizované
+   (maximalizované okno Windows nezvětší, `SetWindowPos` na něm nic neudělá),
+2. přesune ho do levého horního rohu monitoru a zvětší na 4096×4096,
+3. `mstsc` si velikost sám doladí přesně na rozměr relace a zmizí posuvníky,
+4. když je relace menší než okno, `mstsc` ji vycentruje do černých pruhů –
+   ty aplikace najde a okno na ten rozměr stáhne.
+
+Původní umístění si aplikace zapamatuje, takže se stejným tlačítkem
+(**Vrátit okno RDP**) vrátí okno přesně tam, kde bylo.
+
+Roztažení proběhne **automaticky** před výběrem oblasti i před spuštěním
+snímání, takže na tlačítko není nutné sahat – hodí se, když si chcete relaci
+jen prohlédnout nebo v ní něco nastavit.
+
+> Okno pak přesahuje mimo obrazovku a je vidět jen jeho horní část. Tak to má
+> být: snímá se obsah okna, ne to, co je na monitoru.
+
 ### Rozmístění oken
 
-Protože se snímá výhradně tehdy, když je vpředu **Total Commander**, musí být
-snímaná oblast RDP relace v tu chvíli stále vidět. Okno Total Commanderu ji
-nesmí překrývat. V praxi to znamená jedno z:
+Okno Total Commanderu **smí okno RDP překrývat** – snímá se obsah okna, ne to, co
+je zrovna vidět na ploše. Obě okna tedy mohou být kdekoli, klidně přes sebe, a
+okno RDP může přesahovat mimo obrazovku.
 
-* RDP relace na jednom monitoru, Total Commander na druhém *(doporučeno)*,
-* nebo obě okna vedle sebe tak, aby se snímaná oblast nepřekrývala.
+Jediné, co platit musí:
 
-Pokud by Total Commander snímanou oblast zakryl, aplikace bude korektně snímat –
-ale výsledkem budou snímky Total Commanderu, ne dokumentu. Po prvním spuštění se
-proto vyplatí zkontrolovat `page_0001.png` v adresáři relace.
+* okno RDP **nesmí být minimalizované** – minimalizované okno Windows nevykreslují
+  a `PrintWindow` by vrátil prázdnou plochu. Aplikace to kontroluje před startem
+  i před každým snímkem a v takovém případě snímek neuloží.
 
-Pokud během běhu omylem aktivuješ jiné okno, aplikace v dalším kroku správné
+Pokud během běhu omylem aktivujete jiné okno, aplikace v dalším kroku správné
 okno znovu aktivuje a znovu ověří – snímek s nesprávným aktivním oknem nevznikne.
 
 ### Nouzové zastavení
@@ -163,9 +215,6 @@ captures/
         masked/                   <- jen když je vybraná oblast k vymazání
             page_0001.png
             page_0002.png
-        stitched/                 <- jen když je zapnuté skládání snímků
-            page_0001.png
-            page_0002.png
         scraper.log
         RDP_capture_2026-09-08_184500.pdf
 ```
@@ -176,8 +225,7 @@ captures/
   zachovaným poměrem stran. Obrázky se vkládají **bezeztrátově** (`FlateDecode`),
   bez JPEG rekomprese – text na screenshotech zůstane ostrý.
 * V PDF je navíc **vyhledatelný text z OCR** – viz níže.
-* Pořadí zpracování: pořízené snímky → vymazání oblastí → skládání →
-  OCR → PDF. Každý krok je volitelný a při selhání se přeskočí, takže
+* Pořadí zpracování: pořízené snímky → vymazání oblastí → OCR → PDF. Každý krok je volitelný a při selhání se přeskočí, takže
   PDF vznikne vždy.
 
 ---
@@ -266,15 +314,13 @@ vedle `.exe`.
 | Doostření pro PDF [%] | 0 | 0–300; unsharp mask, rozumně 80–150 |
 | Zvětšení snímku pro OCR | 2 | 1–4×; drobné písmo engine rozpozná spolehlivěji |
 | Adresa RDP relace | *(prázdné)* | **povinné** – podle ní se hledá okno `mstsc.exe` |
+| Šířka zakládané RDP relace | 2560 | rozlišení relace, kterou založí tlačítko |
+| Výška zakládané RDP relace | 3600 | určuje strop DPI: výška / 11,69" pro A4 |
 | Metoda odeslání kláves | sendinput | `sendinput` / `postmessage` |
-| Klávesa posuvu | pagedown | čím se posouvá dokument |
-| Stisků na jeden posuv | 1 | pevný počet bez kalibrace |
-| Dopočítat počet stisků | vypnuto | samokalibrace podle překryvu |
 | Provést OCR | zapnuto | vyhledatelná textová vrstva v PDF |
 | Jazyk OCR | cs | jazyková značka, např. `cs` nebo `en-GB` |
 | Vymazané oblasti | žádné | obdélníky odstraněné ze všech stránek |
-| Skládat snímky | vypnuto | složit překrývající se snímky do celých stránek |
-| Výška složené stránky | 0 | 0 = poměr A4 podle šířky pásu |
+| Snímaná oblast | *(prázdné)* | `[x, y, š, v]` v pixelech okna RDP; ukládá se sama |
 
 ### Automatický odhad DPI stránky PDF
 
@@ -420,15 +466,14 @@ snímá **celou stránku** dokumentu, stránku po stránce.
 4. Snímanou oblast pak označte tak, aby obsahovala jen stránku dokumentu,
    bez okrajů okna a bez posuvníku.
 
-> Chcete-li ostřejší obraz než dovolí „Přizpůsobit stránku“, zvětšete zoom na
-> šířku stránky a zapněte **skládání snímků** – viz sekce níže. Adobe Reader
-> pak jednu stránku ukáže na několik obrazovek a aplikace je poskládá zpět;
-> zlom mezi stránkami dokumentu pozná sama.
+> Chcete-li ostřejší obraz, než dovolí „Přizpůsobit stránku“, **nezvětšujte zoom** –
+> zvyšte rozlišení samotné relace, viz
+> [Rozlišení – jak dostat ostrý obraz](#rozlišení--jak-dostat-ostrý-obraz).
+> Zvětšený zoom by znamenal, že se stránka na jeden snímek nevejde.
 
-> **Pozor na okna překrývající snímanou oblast.** Panel s náhledy stránek
-> ani lišta Total Commanderu do snímané oblasti nepatří – zkreslují obraz
-> i skládání. Buď je vynechte z výběru oblasti, nebo je odstraňte funkcí
-> `Vymazat oblast…`, která se uplatní ještě před skládáním.
+> **Panel s náhledy stránek ani lišty Readeru do snímané oblasti nepatří.**
+> Buď je vynechte z výběru oblasti, nebo je odstraňte funkcí `Vymazat oblast…`.
+> Okno Total Commanderu naopak vadit nemůže – snímá se obsah okna RDP, ne plocha.
 
 ### Vymazání oblasti ze všech stránek
 
@@ -452,8 +497,8 @@ Souřadnice se ukládají v pixelech **snímané oblasti**, takže platí pro ka
 stránku stejně. Když ještě nemáte spuštěný Total Commander, dialog nabídne
 místo čerstvého snímku první stránku z poslední relace.
 
-Maska se uplatní **před OCR i před skládáním**, takže se vymazaný text
-nedostane ani do vyhledatelné textové vrstvy PDF.
+Maska se uplatní **před OCR**, takže se vymazaný text nedostane ani do
+vyhledatelné textové vrstvy PDF.
 
 > **Pořízená PNG zůstávají nedotčená.** Vymazané kopie vznikají vedle nich
 > v podadresáři `masked/`. Když vymazání jakkoli selže, PDF se vytvoří
@@ -461,144 +506,92 @@ nedostane ani do vyhledatelné textové vrstvy PDF.
 
 ---
 
-## Krok posuvu – jak zajistit překryv snímků
+## Rozlišení – jak dostat ostrý obraz
 
-Skládání snímků potřebuje, aby se sousední snímky **překrývaly**. Jeden
-`Page Down` ale posune dokument o celou obrazovku nebo víc, takže překryv
-nevznikne vůbec a skládat není podle čeho. Změřeno na skutečném běhu:
-použitelný překryv mělo **0 z 31 spojů**.
+Kvalitu určuje jediné číslo: **kolik pixelů má stránka na výšku uvnitř relace**.
+Celá A4 je vysoká 11,69". Při viewportu vysokém 2160 px z toho vyjde 185 DPI,
+při 3600 px už 300 DPI. Doostření ani zvětšení chybějící detail nedoplní – v
+obraze prostě není.
 
-Řešení je posouvat po menších krocích: místo jednoho `Page Down` poslat
-několik stisků **šipky dolů**. Krok je pak menší než snímaná oblast a překryv
-vzniká vždy.
+Výška monitoru přitom **není** strop. Okno `mstsc.exe` smí být vyšší než
+obrazovka a `PrintWindow` vrátí i to, co je pod jejím okrajem.
 
-### Samokalibrace
+### Co nefunguje
 
-Kolik stisků je potřeba, aplikace zjistí sama:
+Roztáhnout okno už běžící relace nestačí. `mstsc` sice okno zvětší, ale
+dynamicky vyjednané rozlišení relace **zastropuje velikostí fyzického monitoru**.
+Naměřeno na monitoru 3840×2160:
 
-1. první krok pošle **jediný** stisk,
-2. z překryvu obou snímků odečte, o kolik pixelů jeden stisk posune,
-3. dopočítá počet stisků tak, aby krok vyšel na zvolený podíl výšky snímané
-   oblasti (výchozí 85 %),
-4. dál už krok jen **zkracuje** – když překryv zmizí, jde počet stisků
-   na polovinu.
+| velikost okna | plocha relace v okně |
+|---|---|
+| 2560×2160 | 2560×**2160** |
+| 2560×3700 | 2560×**2160** + černý pruh 757 px nahoře i dole |
+| 4400×2160 | **3840**×2160 + černý pruh 280 px vlevo i vpravo |
 
-Nahoru se po prvním určení nekoriguje schválně: na konci stránky prohlížeč
-posuv utne, naměřil by se malý posun a přepočet by počet stisků nafukoval
-donekonečna.
+Okno se zvětší, obrazu nepřibude ani pixel.
 
-Příklad z praxe (oblast vysoká 1814 px, šipka dolů posune 58 px):
+### Co funguje
 
+Relaci je potřeba **založit** s vyšším rozlišením, ne ji zvětšovat za běhu.
+Obstará to tlačítko **Založit RDP relaci…**: podle adresy a rozlišení
+z Nastavení vygeneruje vedle `.exe` soubor `rdp_session.rdp`, spustí nad ním
+`mstsc.exe` a počká, až se přihlásíte. Pak okno rovnou roztáhne na plochu
+relace. Heslo ani bezpečnostní dialog aplikace neřeší – to zůstává na vás.
+
+Vygenerovaný soubor vypadá takto:
+
+```text
+full address:s:192.168.30.10
+screen mode id:i:1
+desktopwidth:i:2560
+desktopheight:i:3600
+smart sizing:i:0
+dynamic resolution:i:0
+session bpp:i:32
+compression:i:0
+connection type:i:6
+networkautodetect:i:0
+bandwidthautodetect:i:0
 ```
-Kalibrace posuvu: jeden stisk posune 58 px, krok upraven z 1 na 27 stisků (cíl 1542 px)
-```
 
-Krok pak vyjde na 1566 px, tedy **248 px překryvu** – víc než dost na
-spolehlivé zarovnání.
+Podstatné jsou `desktopwidth`/`desktopheight` (rozlišení relace),
+`smart sizing:i:0` (jinak by `mstsc` obraz zmenšoval do okna a rozlišení by se
+zahodilo) a `dynamic resolution:i:0` (jinak by relace opět spadla na velikost
+monitoru). `compression:i:0` a LAN profil drží kodek RDP co nejblíž
+bezeztrátovému – při vyšším rozlišení je to znát na ostrosti písma.
+Žádné přihlašovací údaje se do souboru nezapisují.
 
-### Nastavení
+> Když už relace k dané adrese běží, nové připojení ji **převezme**. Aplikace se
+> na to předem zeptá. Otevřené aplikace na serveru zůstanou, jen se přepočítá
+> plocha.
 
-| Parametr | Výchozí | Význam |
-|---|---|---|
-| Klávesa posuvu | pagedown | `pagedown`, `down`, `space`, `up`, `pageup`, `right`, `left`, `home`, `end`, `enter` |
-| Stisků na jeden posuv | 1 | pevný počet, když je kalibrace vypnutá |
-| Pauza mezi stisky | 30 ms | aby prohlížeč stihl reagovat |
-| Dopočítat počet stisků | vypnuto | samokalibrace podle překryvu |
-| Cílový krok | 0.85 | podíl výšky snímané oblasti |
+> Když server zadané rozlišení odmítne, relace se založí menší a aplikace to
+> ohlásí. Starší servery odmítají výšku nad 2048 px – zkuste pak menší hodnotu.
 
-> Pro Adobe Reader se osvědčí `down` se zapnutou kalibrací. Cenou je víc
-> snímků na stránku, a tedy delší běh – zato skládání dostane překryv,
-> který potřebuje.
+### Nastavení prohlížeče
 
----
-
-## Skládání snímků – jak dostat vyšší kvalitu
-
-Výška obrazovky je tvrdý strop kvality. Celá A4 se do výšky 2079 px vejde
-nejvýš při **178 DPI**, na Full HD (1080 px) dokonce jen při **~92 DPI**.
-Doostření ani zvětšení už chybějící detail nedoplní – v obraze prostě není.
-
-Jediná cesta k ostřejšímu obrazu vede přes větší zoom ve vzdáleném prohlížeči.
-Pak se ale na jednu obrazovku vejde jen část stránky. Od toho je volba
-**Nastavení → „Skládat překrývající se snímky do celých stránek“**.
-
-### Jak to pracuje
-
-1. Z každého snímku se spočítá **profil řádků** – průměrný jas každého řádku.
-   Dělá se to zmenšením na šířku 1 px filtrem BOX, tedy přesným průměrem
-   v C (~16 ms na snímek), bez jakékoli další knihovny.
-2. Projdou se **všechny** celočíselné posuny a profily se porovnají na každém
-   čtvrtém řádku. Podvzorkování je fázově přesné pro libovolný posun; hrubá
-   mřížka s průměrováním by posun, který není násobkem kroku, rozfázovala.
-3. Nalezený posun se **ověří na skutečných pixelech** v plném rozlišení.
-   Samotný profil nestačí: řádky textu se opakují pravidelně, takže sedí
-   i při posunu o celý řádek.
-4. Posuny, které se vymykají obvyklé hodnotě, se přezkoumají v jejím okolí.
-   `Page Down` posouvá konstantně, takže odlehlá hodnota je podezřelá –
-   a dokumenty mívají na každé stránce stejné záhlaví, na které se dá
-   přesvědčivě, ale chybně napasovat. Když pro odlehlý posun není v okolí
-   obvyklé hodnoty opora, zahodí se a použije se obvyklý posun.
-5. Pás se rozřeže na stránky v **nejsvětlejším místě** poblíž cílové výšky.
-   Má-li prohlížeč mezi stránkami mezeru, řez si ji najde sám; jinak se
-   řeže mezi řádky textu.
-
-Výchozí výška stránky odpovídá poměru A4 podle šířky pásu; lze ji přebít
-v nastavení.
-
-### Zlom stránky
-
-Prohlížeče PDF neposouvají donekonečna. Adobe Reader dojede na konec stránky
-a pak skočí na další – sousední snímky pak nemají žádný společný obsah.
-Takový spoj se **nesmí odhadovat**, jinak se dvě různé stránky slepí do
-jednoho pásu na náhodné pozici.
-
-Když se překryv nenajde, rozhoduje se takto:
-
-1. **Sedí pixely při obvyklém posunu?** Pak šlo jen o prázdný pruh a použije
-   se obvyklý posun.
-2. **Sahá text ke spodnímu okraji prvního snímku nebo k hornímu okraji
-   druhého?** Pak prohlížeč posunul přesně o obrazovku a snímky se spojí
-   na doraz. Nulový překryv je u `Page Down` běžný.
-3. **Jsou oba okraje prázdné?** Stránka skončila – začíná nová stránka
-   a v tom místě se pás vždy rozřízne.
-
-Prahy jsou odvozené z měření na skutečných snímcích: pravý překryv dává
-průměrný rozdíl pixelů 0,002–0,016, zatímco nejlepší možná shoda dvou
-různých stránek 0,060–0,124. Práh je 0,030.
-
-Odmítá se také **prázdný překryv**: v pruhu bez textu sedí na sebe cokoli,
-takže se vyžaduje aspoň 12 řádků textu, a to na obou snímcích. Bez toho se
-64 px bílé plochy „shodlo“ s jinou bílou plochou a vyrobilo přesvědčivý,
-ale nesmyslný posun.
-
-### Bezpečnost dat
-
-Pořízená PNG zůstávají nedotčená. Složené stránky vznikají vedle nich
-v podadresáři `stitched/`. Když skládání jakkoli selže, PDF se vytvoří
-z původních snímků přesně jako dosud.
-
-Naměřeno: ~50–90 ms na spoj, tedy u padesátistránkového dokumentu několik
-sekund.
-
----
+V Adobe Readeru pak stačí **Jedna stránka** + **Přizpůsobit stránku** a jeden
+`Page Down` = jedna stránka dokumentu = jeden snímek. Žádné posouvání po částech,
+žádné skládání.
 
 ## DPI a více monitorů
 
 Aplikace zapíná **per-monitor DPI awareness v2** (`SetProcessDpiAwarenessContext`)
-ještě před vytvořením prvního okna – souřadnice výběru proto odpovídají skutečným
-pixelům při škálování 100 %, 125 %, 150 % i 175 %.
+ještě před vytvořením prvního okna, takže `GetClientRect` i `PrintWindow` pracují
+se skutečnými pixely při škálování 100 %, 125 %, 150 % i 175 %.
 
-Překryv pro výběr oblasti pokrývá celou virtuální plochu včetně **záporných
-souřadnic** monitorů umístěných vlevo od primárního. Total Commander a RDP mohou
-být na různých monitorech.
+Na tom, kde okno RDP na ploše leží a přes který monitor je roztažené, nezáleží –
+souřadnice oblasti jsou vázané na okno. Total Commander může být na jiném
+monitoru, na stejném, nebo okno RDP překrývat.
 
 ## Ošetřené chybové stavy
 
 Total Commander není spuštěn · RDP není spuštěno · není vyplněna adresa RDP relace ·
 relace k zadané adrese nenalezena · RDP nebo Total Commander zavřen během běhu · okno nelze aktivovat ·
-screenshot se nepodařilo pořídit · neplatná nebo prázdná oblast · do pracovního
-adresáře nelze zapisovat · selhání tvorby PDF · přerušení uživatelem ·
-překročení maximálního počtu snímků.
+screenshot se nepodařilo pořídit · okno RDP minimalizované · snímek okna je
+jednolitě černý · snímaná oblast přesahuje okno RDP (okno změnilo velikost) ·
+neplatná nebo prázdná oblast · do pracovního adresáře nelze zapisovat ·
+selhání tvorby PDF · přerušení uživatelem · překročení maximálního počtu snímků.
 
 **Žádná z těchto situací nevede ke ztrátě již pořízených snímků.** PNG soubory
 zůstávají na disku a PDF z nich lze kdykoliv vytvořit tlačítkem
@@ -622,13 +615,12 @@ rdp-screenshot-scraper/
 ├── src/
 │   ├── main.py             vstupní bod, zapnutí DPI awareness
 │   ├── gui.py              tkinter GUI, nastavení, výběr okna
-│   ├── window_manager.py   Win32 API: hledání, aktivace, ověření, Page Down
-│   ├── capture.py          screenshot oblasti (mss), validace oblasti
-│   ├── region_selector.py  fullscreen overlay pro výběr oblasti myší
+│   ├── window_manager.py   Win32 API: hledání, aktivace, ověření, geometrie, Page Down
+│   ├── capture.py          snímání okna přes PrintWindow, validace oblasti
 │   ├── image_compare.py    dHash + rozdíl pixelů, detekce konce
 │   ├── ocr.py              OCR přes engine vestavěný ve Windows
 │   ├── mask.py             vymazání zvolené oblasti ze všech stránek
-│   ├── stitch.py           skládání překrývajících se snímků do stránek
+│   ├── rdp_session.py      generování .rdp a založení relace s pevným rozlišením
 │   ├── pdf_export.py       bezeztrátové PDF + neviditelná textová vrstva
 │   ├── automation.py       snímací cyklus, stavy, logování
 │   └── config.py           config.json, pracovní adresář, adresáře relací
@@ -642,12 +634,11 @@ rdp-screenshot-scraper/
     ├── test_ocr.py
     ├── test_pdf_export.py
     ├── test_pdf_text_layer.py
-    ├── test_region_selector.py
-    ├── test_stitch.py
+    ├── test_rdp_session.py
     └── test_window_manager.py
 ```
 
 ## Kurzor myši
 
-Snímky vznikají přes `mss` (BitBlt nad desktop DC), který kurzor myši
-nezachycuje. Kurzor tedy nemůže ovlivnit ani detekci konce dokumentu.
+`PrintWindow` vykresluje obsah okna, kurzor myši do něj nepatří. Kurzor tedy
+nemůže ovlivnit ani detekci konce dokumentu.

@@ -9,6 +9,8 @@ __pycache__/
 # Výstupy běhu aplikace – snímky obrazovky, logy a PDF konkrétních relací
 captures/
 config.json
+# .rdp soubor si aplikace generuje sama a obsahuje adresu serveru
+rdp_session.rdp
 
 # Lokální nastavení nástrojů
 .claude/

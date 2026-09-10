@@ -14,12 +14,13 @@ Nic se nestahuje.
 
 | balíček | k čemu |
 |---|---|
-| `mss` | pořizování screenshotů oblasti obrazovky |
 | `pillow` | práce s obrázky a PNG |
 | `pyinstaller`, `pyinstaller-hooks-contrib` | sestavení `.exe` |
 | `altgraph`, `pefile`, `pywin32-ctypes`, `packaging`, `setuptools` | závislosti PyInstalleru |
 
-Aplikace samotná za běhu potřebuje pouze `mss` a `Pillow`. Zbytek je jen pro build.
+Aplikace samotná za běhu potřebuje pouze `Pillow`. Zbytek je jen pro build.
+Kolečko `mss` zůstává v adresáři kvůli starším verzím; od přechodu na
+`PrintWindow` se už neinstaluje.
 Práce s okny (Win32 API) je řešena přes `ctypes` ze standardní knihovny,
 `pywin32` proto přiložený není a není potřeba.
 
