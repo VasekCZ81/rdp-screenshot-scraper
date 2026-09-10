@@ -1036,20 +1036,20 @@ class ScraperApp(tk.Tk):
 
         def worker() -> None:
             try:
-                masked = mask_captures(
-                    self.config_obj,
-                    pages,
-                    session_dir,
-                    status=lambda text: self._emit("status", text),
-                    log=lambda message: self._emit("log", message),
-                )
                 sources = stitch_captures(
                     self.config_obj,
                     pages,
                     session_dir,
                     status=lambda text: self._emit("status", text),
                     log=lambda message: self._emit("log", message),
-                    render_files=masked,
+                    holes=mask_mod.normalize_rects(self.config_obj.mask_rects),
+                )
+                sources = mask_captures(
+                    self.config_obj,
+                    sources,
+                    session_dir,
+                    status=lambda text: self._emit("status", text),
+                    log=lambda message: self._emit("log", message),
                 )
                 layers = ocr_pages(
                     self.config_obj,

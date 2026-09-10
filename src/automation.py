@@ -212,20 +212,21 @@ def stitch_captures(
     session_dir: str,
     status: Callable[[str], None] | None = None,
     log: Callable[[str], None] | None = None,
-    render_files: list[str] | None = None,
+    holes: list | None = None,
 ) -> list[str]:
     """Složí překrývající se snímky do stránek. Vrací cesty, které mají jít do PDF.
 
-    Zarovnání běží nad `page_files`, tedy nad **původními** snímky. Vykresluje se
-    z `render_files` (typicky kopie s vymazanou oblastí) – vymazaná plocha je
-    bílá a zarovnat se podle ní nedá.
+    Zarovnání i kreslení běží nad **původními** snímky. Vymazané oblasti se
+    předávají jako `holes` – nekreslí se vůbec, takže je vyplní sousední snímek,
+    který na tom místě obsah má. Bílá výplň by po složení padla doprostřed
+    stránky a přepsala by obsah. Samotné vybílení proto obstará až
+    `mask_captures()` nad hotovými stránkami.
 
     Pořízené snímky zůstávají nedotčené, složené stránky vznikají v podadresáři
     `stitched/`. Když skládání selže, vrátí se snímky, které do něj vstoupily.
     """
-    fallback = render_files or page_files
     if not config.stitch_enabled or len(page_files) < 2:
-        return fallback
+        return page_files
 
     out_dir = os.path.join(session_dir, cfg_mod.STITCHED_DIRNAME)
     try:
@@ -236,17 +237,17 @@ def stitch_captures(
             out_dir,
             page_height=config.stitch_page_height_px,
             log=log,
-            render_paths=render_files,
+            holes=holes,
         )
     except (stitch.StitchError, OSError, ValueError) as exc:
         if log:
             log(f"Skládání selhalo, PDF vznikne z původních snímků: {exc}")
-        return fallback
+        return page_files
 
     if not pages:
         if log:
             log("Skládání nevrátilo žádnou stránku, používám původní snímky.")
-        return fallback
+        return page_files
     if log:
         log(f"Skládání: {len(page_files)} snímků složeno do {len(pages)} stránek")
     return pages
@@ -667,21 +668,21 @@ class AutomationController:
         name = os.path.basename(self.session_dir.rstrip("\\/"))
         pdf_path = os.path.join(self.session_dir, f"RDP_capture_{name}.pdf")
 
-        masked = mask_captures(
-            self.config,
-            self.page_files,
-            self.session_dir,
-            status=lambda text: self.emit("status", text),
-            log=self._log,
-        )
-
         pages = stitch_captures(
             self.config,
             self.page_files,
             self.session_dir,
             status=lambda text: self.emit("status", text),
             log=self._log,
-            render_files=masked,
+            holes=mask_mod.normalize_rects(self.config.mask_rects),
+        )
+
+        pages = mask_captures(
+            self.config,
+            pages,
+            self.session_dir,
+            status=lambda text: self.emit("status", text),
+            log=self._log,
         )
 
         layers = ocr_pages(

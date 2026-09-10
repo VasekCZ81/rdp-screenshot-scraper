@@ -5,9 +5,15 @@ vodoznak, hlavičku nebo číslo stránky – a ten se na **všech** snímcích
 přebarví na bílo. Souřadnice se udávají v pixelech snímané oblasti, takže
 platí pro každou stránku stejně.
 
-Maska se uplatní ještě před OCR, takže se vymazaný text nedostane ani do
-neviditelné textové vrstvy PDF. Pořízená PNG zůstávají nedotčená – vymazané
-kopie vznikají vedle nich v podadresáři `masked/`.
+Maska se uplatní na **hotové stránky**, tedy až po případném skládání, a ještě
+před OCR – vymazaný text se tak nedostane ani do neviditelné textové vrstvy PDF.
+
+Při skládání se stejné obdélníky navíc předávají jako „díry“, které se
+nekreslí. Bez toho by bílá výplň z jednoho snímku padla doprostřed složené
+stránky a přepsala obsah, který sousední snímek má v pořádku.
+
+Pořízená PNG zůstávají nedotčená – vymazané kopie vznikají v podadresáři
+`masked/`.
 """
 
 from __future__ import annotations

@@ -310,5 +310,121 @@ class TestStitchCaptures(StitchTestCase):
         self.assertIn(automation.Status.STITCHING.value, statuses)
 
 
+class TestMaskedAreasAreNotPainted(StitchTestCase):
+    """Regrese: vymazaná plocha se kreslila bíle doprostřed složené stránky.
+
+    Maska je zadaná v souřadnicích snímku. Po složení nepadne na okraj stránky,
+    ale doprostřed – bílá výplň tam přepsala obsah, který sousední snímek měl
+    v pořádku. Na skutečném běhu to ukrojilo čtyři řádky textu.
+    """
+
+    def _document_and_shots(self, hole_height=120):
+        # Překryv musí být vyšší než maska, jinak nemá díru čím vyplnit:
+        # posun 400 z výšky 600 dává 200 px překryvu na 120px masku.
+        document = tall_document(lines=90)
+        shots, tops = slice_document(document, 600, [400, 400, 400])
+        return document, shots, tops
+
+    def test_hole_is_filled_from_the_neighbouring_shot(self):
+        import mask as mask_mod
+
+        document, shots, tops = self._document_and_shots()
+        paths = self.save(shots)
+        plan = stitch.plan_ribbon(paths)
+        holes = [mask_mod.MaskRect(0, 0, shots[0].size[0], 120)]
+        out = stitch.render_pages(
+            plan, [(0, plan.height)], os.path.join(self.dir, "out"), holes=holes
+        )
+        with Image.open(out[0]) as ribbon:
+            original = document.crop(
+                (0, tops[0], document.size[0], tops[0] + plan.height)
+            )
+            # Horních 120 px pásu nemá kdo vyplnit – tam bílá zůstane.
+            body = ribbon.convert("RGB").crop((0, 130, ribbon.size[0], ribbon.size[1]))
+            reference = original.crop((0, 130, original.size[0], original.size[1]))
+            diff = ImageChops.difference(body, reference)
+            self.assertEqual(
+                max(diff.getextrema(), key=lambda t: t[1])[1],
+                0,
+                "díra po masce měla být vyplněna sousedním snímkem",
+            )
+
+    def test_without_holes_the_white_band_would_damage_the_page(self):
+        """Kontrolní protipól: bílá výplň obsah opravdu ničí."""
+        import mask as mask_mod
+
+        document, shots, tops = self._document_and_shots()
+        paths = self.save(shots)
+        white = [mask_mod.draw_masks(s, [mask_mod.MaskRect(0, 0, s.size[0], 120)])
+                 for s in shots]
+        white_dir = os.path.join(self.dir, "white")
+        os.makedirs(white_dir, exist_ok=True)
+        white_paths = []
+        for index, image in enumerate(white, start=1):
+            path = os.path.join(white_dir, f"page_{index:04d}.png")
+            image.save(path, "PNG")
+            white_paths.append(path)
+
+        plan = stitch.plan_ribbon(paths)
+        out = stitch.render_pages(
+            plan, [(0, plan.height)], os.path.join(self.dir, "bad"), sources=white_paths
+        )
+        with Image.open(out[0]) as ribbon:
+            original = document.crop(
+                (0, tops[0], document.size[0], tops[0] + plan.height)
+            )
+            body = ribbon.convert("RGB").crop((0, 130, ribbon.size[0], ribbon.size[1]))
+            reference = original.crop((0, 130, original.size[0], original.size[1]))
+            diff = ImageChops.difference(body, reference)
+            self.assertGreater(
+                max(diff.getextrema(), key=lambda t: t[1])[1],
+                0,
+                "bez děr musí bílý pruh obsah poškodit – jinak test nic nehlídá",
+            )
+
+
+class TestProfileScoreIsOnlyRanking(StitchTestCase):
+    """Regrese: strop na skóre profilu vyřadil správný posun před kontrolou pixelů.
+
+    Na skutečném spoji byl správný posun v žebříčku první, ale jeho skóre
+    profilu 8.6 přesáhlo tehdejší strop 6.0, takže se smyčka ukončila dřív,
+    než se vůbec dostalo na porovnání pixelů.
+    """
+
+    def test_high_profile_score_still_gets_verified(self):
+        document = tall_document(lines=120)
+        shots, tops = slice_document(document, 700, [640])
+        # Druhý snímek zašumíme tak, aby profil seděl hůř, ale pixely pořád dobře.
+        noisy = shots[1].copy()
+        draw = ImageDraw.Draw(noisy)
+        for y in range(0, noisy.size[1], 40):
+            draw.rectangle([noisy.size[0] - 60, y, noisy.size[0] - 10, y + 12],
+                           fill="black")
+        paths = self.save([shots[0], noisy])
+        found, _error = stitch.find_shift(shots[0], noisy)
+        self.assertEqual(found, tops[1] - tops[0],
+                         "posun musí projít i při horším skóre profilu")
+        self.assertTrue(paths)
+
+    def test_number_of_pixel_checks_is_bounded(self):
+        """Práci omezuje počet ověření, ne práh na profilu."""
+        document = tall_document(lines=80)
+        shots, _tops = slice_document(document, 500, [460])
+        calls = []
+        real = stitch._overlap_difference
+
+        def counting(prev, curr, shift):
+            calls.append(shift)
+            return 1.0          # nikdy neprojde -> vyčerpá se limit
+
+        stitch._overlap_difference = counting
+        try:
+            found, _error = stitch.find_shift(shots[0], shots[1])
+        finally:
+            stitch._overlap_difference = real
+        self.assertIsNone(found)
+        self.assertLessEqual(len(calls), stitch.CANDIDATES)
+
+
 if __name__ == "__main__":
     unittest.main()

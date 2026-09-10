@@ -35,6 +35,14 @@ do jednoho pásu na náhodné pozici.
 Prázdný překryv se odmítá: v pruhu bez textu sedí na sebe cokoli. Vyžaduje
 se, aby překryv obsahoval dost řádků textu, a to na **obou** snímcích.
 
+Vymazané oblasti se při skládání **nekreslí**, místo aby se vybarvily bíle.
+Vyplnit je ze sousedního snímku jde jen tehdy, když je překryv vyšší než maska;
+jinak část místa zůstane bílá.
+Maska je zadaná v souřadnicích snímku, takže po složení nepadne na okraj
+stránky, ale doprostřed – bílá výplň by tam přepsala obsah, který sousední
+snímek má v pořádku. Vynechané místo se vyplní z něj; jen když ho nemá žádný
+snímek, zůstane bílé.
+
 Když překryv chybí úplně, rozhoduje obsah u okrajů. Posunul-li prohlížeč
 přesně o celou obrazovku, text sahá až ke spodnímu okraji prvního snímku
 a hned pokračuje u horního okraje druhého – snímky se pak spojí na doraz.
@@ -48,7 +56,7 @@ from array import array
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageDraw, ImageStat
 
 SCORE_STRIDE = 4           # každý čtvrtý řádek stačí na seřazení kandidátů
 MIN_OVERLAP_PX = 16        # Page Down často nechá překryv jen pár řádků
@@ -59,10 +67,11 @@ USEFUL_SHIFT_RATIO = 0.10  # menší posun než desetina výšky je pro skládá
 TEXT_ROW_DELTA = 15        # o kolik musí být řádek tmavší než pozadí
 OUTLIER_MAD_FACTOR = 4.0   # odchylka od obvyklého posuvu, kterou ještě tolerujeme
 MIN_TOLERANCE_PX = 24      # minimální tolerance, když je posuv naprosto pravidelný
-MAX_PROFILE_DIFF = 6.0     # max. průměrný rozdíl profilů (odstíny šedi)
-# Naměřeno na skutečných snímcích: pravý překryv dává 0.002-0.016,
-# nejlepší možná shoda dvou různých stránek 0.060-0.124.
-MAX_VERIFY_DIFF = 0.030    # max. průměrný rozdíl pixelů v překryvu (0.0-1.0)
+# Naměřeno na skutečných snímcích: pravý překryv dává 0.000-0.031 (horní konec
+# u snímků, které klient RDP překreslil s jinými detaily), zatímco nejlepší
+# možná shoda dvou různých stránek 0.060-0.124. Práh leží uprostřed té mezery.
+# Proti falešné shodě navíc chrání kontrola odlehlých posunů v plan_ribbon().
+MAX_VERIFY_DIFF = 0.045    # max. průměrný rozdíl pixelů v překryvu (0.0-1.0)
 CANDIDATES = 8             # kolik nejlepších posunů ověřit na pixelech
 PROFILE_MARGIN = 0.04      # okraje vynecháme (posuvník, rámeček okna)
 A4_RATIO = 297.0 / 210.0
@@ -216,8 +225,12 @@ def find_shift(
     odlehlých výsledků: dokumenty mívají na každé stránce stejné záhlaví,
     takže překryv může přesvědčivě sednout i na nesprávné místo.
 
-    Profil řádků slouží jen jako rychlé předsíto; o výsledku rozhoduje
-    porovnání skutečných pixelů v překryvu. Řádky textu se opakují
+    Profil řádků slouží **jen k seřazení** kandidátů; o výsledku rozhoduje
+    porovnání skutečných pixelů v překryvu. Na hodnotu profilu se proto
+    nesmí nasadit strop – naměřeno na skutečném spoji: správný posun byl
+    v žebříčku první, ale jeho skóre profilu 8.6 by ho vyřadilo dřív, než
+    by se vůbec dostal na kontrolu pixelů. Práci místo toho omezuje počet
+    ověřených kandidátů. Řádky textu se opakují
     pravidelně, takže profil sedí i při posunu o celý řádek – teprve pixely
     odliší tentýž text od jiného textu na stejné pozici.
     """
@@ -231,13 +244,15 @@ def find_shift(
     prev_profile = list(prev_profile if prev_profile is not None else row_profile(prev_image))
     curr_profile = list(curr_profile if curr_profile is not None else row_profile(curr_image))
 
+    checked = 0
     for score, shift in _candidate_shifts(prev_profile, curr_profile, min_overlap):
-        if score > MAX_PROFILE_DIFF:
-            break
         if prefer is not None and abs(shift - prefer) > window:
             continue
         if _overlap_difference(prev_image, curr_image, shift) <= MAX_VERIFY_DIFF:
             return shift, score
+        checked += 1
+        if checked >= CANDIDATES:
+            break
     return None, 0.0
 
 
@@ -568,6 +583,24 @@ def _split_segment(
     return cuts
 
 
+def _paste_stencil(size: tuple[int, int], holes: Sequence[tuple[int, int, int, int]],
+                   offset_y: int):
+    """Maska pro vkládání: 0 tam, kde se kreslit nemá."""
+    if not holes:
+        return None
+    stencil = Image.new("L", size, 255)
+    draw = ImageDraw.Draw(stencil)
+    width, height = size
+    for left, top, right, bottom in holes:
+        y0 = max(0, top - offset_y)
+        y1 = min(height, bottom - offset_y)
+        x0 = max(0, left)
+        x1 = min(width, right)
+        if x1 > x0 and y1 > y0:
+            draw.rectangle([x0, y0, x1 - 1, y1 - 1], fill=0)
+    return stencil
+
+
 def render_pages(
     plan: RibbonPlan,
     cuts: Sequence[tuple[int, int]],
@@ -576,17 +609,23 @@ def render_pages(
     digits: int = 4,
     log: Callable[[str], None] | None = None,
     sources: Sequence[str] | None = None,
+    holes: Sequence[object] | None = None,
 ) -> list[str]:
     """Vykreslí stránky pásu do souborů. Otevírá jen snímky, které stránka potřebuje.
 
-    `sources` umožní vykreslit z jiných souborů, než podle kterých se zarovnávalo –
-    typicky z kopií s vymazanou oblastí. Zarovnání totiž musí běžet nad původním
-    obrazem: vymazaná plocha je bílá a nedá se podle ní nic poznat.
+    `sources` umožní vykreslit z jiných souborů, než podle kterých se zarovnávalo.
+    `holes` jsou obdélníky v souřadnicích snímku, které se nemají kreslit vůbec –
+    vyplní je sousední snímek, který na tom místě obsah má.
     """
     os.makedirs(out_dir, exist_ok=True)
     written: list[str] = []
 
     by_path = dict(zip((p.path for p in plan.placements), sources or ()))
+    hole_boxes = [
+        (r.x, r.y, r.x + r.width, r.y + r.height)
+        for r in (holes or [])
+        if r.width > 0 and r.height > 0
+    ]
 
     for number, (top, bottom) in enumerate(cuts, start=1):
         height = bottom - top
@@ -601,7 +640,8 @@ def render_pages(
                 src_top = max(0, top - placement.top)
                 src_bottom = min(placement.height, bottom - placement.top)
                 piece = source.crop((0, src_top, placement.width, src_bottom))
-            canvas.paste(piece, (0, placement.top + src_top - top))
+            stencil = _paste_stencil(piece.size, hole_boxes, src_top)
+            canvas.paste(piece, (0, placement.top + src_top - top), stencil)
 
         path = os.path.join(out_dir, f"{prefix}{number:0{digits}d}.png")
         canvas.save(path, "PNG")
@@ -619,6 +659,7 @@ def stitch_pages(
     page_height: int = 0,
     log: Callable[[str], None] | None = None,
     render_paths: Sequence[str] | None = None,
+    holes: Sequence[object] | None = None,
 ) -> list[str]:
     """Složí snímky do pásu a rozřeže je na stránky. Vrací cesty k novým PNG.
 
@@ -635,4 +676,6 @@ def stitch_pages(
             f"(výška stránky {page_height} px)"
             + (f", neověřených spojů: {len(unverified)}" if unverified else "")
         )
-    return render_pages(plan, cuts, out_dir, log=log, sources=render_paths)
+    return render_pages(
+        plan, cuts, out_dir, log=log, sources=render_paths, holes=holes
+    )
